@@ -1030,7 +1030,7 @@ as independent matrices.
 
 ### 8.4 Stochastic Bivector Exponentials
 
-For very large $n$ (e.g., $n > 2048$), computing $\exp(B)$ via $\texttt{torch.matrix\_exp}$
+For very large $n$ (e.g., $n > 2048$), computing $\exp(B)$ via `torch.matrix_exp`
 becomes expensive ($O(n^3)$ with large constants). Stochastic approximations:
 
 - **Taylor truncation:** $\exp(B) \approx I + B + B^2/2$ (valid for small $\|B\|$)
