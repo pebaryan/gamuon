@@ -274,6 +274,42 @@ def get_param_groups(model: nn.Module, lr: float) -> list[dict]:
     return groups
 
 
+def extract_norm_params(model: nn.Module) -> dict[str, tuple[float, float]]:
+    """Extract LayerNorm (γ, β) mean values from a model.
+
+    Returns a dict mapping layer name → (gamma_mean, beta_mean).
+    """
+    params = {}
+    for name, mod in model.named_modules():
+        if isinstance(mod, nn.LayerNorm):
+            gamma = mod.weight.data.mean().item() if mod.weight is not None else 0.0
+            beta = mod.bias.data.mean().item() if mod.bias is not None else 0.0
+            params[name] = (gamma, beta)
+    return params
+
+
+def extract_norm_tensors(model: nn.Module) -> dict[str, dict]:
+    """Extract full (γ, β) tensors from LayerNorm layers, plus their means.
+
+    Returns a dict mapping layer name → {"gamma": tensor, "beta": tensor,
+    "gamma_mean": float, "beta_mean": float}.
+    """
+    data = {}
+    for name, mod in model.named_modules():
+        if isinstance(mod, nn.LayerNorm):
+            g = mod.weight.data.detach().clone() if mod.weight is not None else None
+            b = mod.bias.data.detach().clone() if mod.bias is not None else None
+            data[name] = {
+                "gamma": g,
+                "beta": b,
+                "gamma_mean": g.mean().item() if g is not None else 0.0,
+                "beta_mean": b.mean().item() if b is not None else 0.0,
+                "gamma_norm": g.norm().item() if g is not None else 0.0,
+                "beta_norm": b.norm().item() if b is not None else 0.0,
+            }
+    return data
+
+
 def run_training(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -283,12 +319,24 @@ def run_training(
     seq_len: int,
     device: torch.device,
     label: str,
+    *,
+    track_norms: bool = False,
+    norm_capture_interval: int = 50,
 ) -> dict:
-    """Run training and return loss history + timing data."""
+    """Run training and return loss history + timing data.
+
+    If track_norms is True, snapshots of LayerNorm (γ, β) mean values
+    are recorded every norm_capture_interval steps.
+    """
     model.train()
     losses = []
     step_times = []
+    norm_trajectories: list[dict] = []
     total_start = time.perf_counter()
+
+    # Capture initial norm params if tracking is enabled
+    if track_norms:
+        norm_trajectories.append({"step": 0, "layers": extract_norm_tensors(model)})
 
     for step in range(steps):
         x, y = generate_batch(vocab_size, batch_size, seq_len, device)
@@ -311,6 +359,17 @@ def run_training(
             print(f"  [{label}] step {step + 1:5d}/{steps}  loss {loss.item():.4f}  "
                   f"time/step {step_times[-1]:.4f}s")
 
+        # Capture norm params at intervals
+        if track_norms and (step + 1) % norm_capture_interval == 0:
+            norm_trajectories.append({
+                "step": step + 1,
+                "layers": extract_norm_tensors(model),
+            })
+
+    # Final norm capture
+    if track_norms and steps % norm_capture_interval != 0:
+        norm_trajectories.append({"step": steps, "layers": extract_norm_tensors(model)})
+
     total_time = time.perf_counter() - total_start
 
     return {
@@ -323,12 +382,144 @@ def run_training(
         "mean_step_time_s": sum(step_times) / len(step_times),
         "median_step_time_s": sorted(step_times)[len(step_times) // 2],
         "step_times": step_times,
+        "norm_trajectories": norm_trajectories if track_norms else [],
     }
 
 
 # ╔══════════════════════════════════════════════════════════════════════╗
 # ║  PLOTTING                                                           ║
 # ╚══════════════════════════════════════════════════════════════════════╝
+
+
+def print_norm_comparison(results: list[dict]):
+    """Print a comparison table of LayerNorm γ/β trajectories.
+
+    Compares the two norm-update strategies used in this benchmark:
+    - Gamuon (uses SGD for norm-layer params)
+    - Gamuon+Conf (uses ConformalMuon for norm-layer params)
+
+    Prints initial → final values for each LayerNorm layer.
+    """
+    # Find Gamuon and Gamuon+Conf results with norm trajectories
+    gamuon_r = next((r for r in results if r["label"] == "Gamuon" and r.get("norm_trajectories")), None)
+    conformal_r = next((r for r in results if r["label"] == "Gamuon+Conf" and r.get("norm_trajectories")), None)
+
+    if not gamuon_r or not conformal_r:
+        return
+
+    # Get initial (shared) and final states
+    init_layers = gamuon_r["norm_trajectories"][0]["layers"]
+    sgd_final = gamuon_r["norm_trajectories"][-1]["layers"]
+    conf_final = conformal_r["norm_trajectories"][-1]["layers"]
+
+    print(f"{'=' * 85}")
+    print("  LayerNorm \u03b3/\u03b2  —  ConformalMuon vs SGD")
+    print(f"{'=' * 85}")
+    header = (
+        f"{'Layer':<22} {'\u03b3 init':<10} {'\u03b3 SGD':<10} {'\u03b3 Conf':<10}"
+        f" {'\u03b2 init':<10} {'\u03b2 SGD':<10} {'\u03b2 Conf':<10}"
+    )
+    print(header)
+    print("-" * 85)
+
+    for layer_name in init_layers:
+        init = init_layers[layer_name]
+        sgd = sgd_final.get(layer_name, {})
+        conf = conf_final.get(layer_name, {})
+        print(
+            f"{layer_name:<22} "
+            f"{init['gamma_mean']:<10.4f} {sgd.get('gamma_mean', 0):<10.4f} {conf.get('gamma_mean', 0):<10.4f} "
+            f"{init['beta_mean']:<10.4f} {sgd.get('beta_mean', 0):<10.4f} {conf.get('beta_mean', 0):<10.4f}"
+        )
+
+    # Summary statistics
+    print("-" * 85)
+    # Compute gamma norms
+    sgd_gamma_norm = sum(sgd_final[ln]["gamma_norm"] for ln in sgd_final)
+    conf_gamma_norm = sum(conf_final[ln]["gamma_norm"] for ln in conf_final)
+    sgd_beta_norm = sum(abs(sgd_final[ln]["beta_mean"]) for ln in sgd_final)
+    conf_beta_norm = sum(abs(conf_final[ln]["beta_mean"]) for ln in conf_final)
+
+    print(f"{'Total \u03b3 \u2113\u2082':<22} {'':<10}"
+          f"{sgd_gamma_norm:<10.4f} {conf_gamma_norm:<10.4f} {'':<21}")
+    print(f"{'Total |\u03b2| mean':<22} {'':<10}"
+          f"{sgd_beta_norm:<10.4f} {conf_beta_norm:<10.4f} {'':<21}")
+    print()
+
+
+def plot_norm_trajectories(results: list[dict], save_path: Optional[Path] = None):
+    """Generate a separate figure showing LayerNorm \u03b3/\u03b2 trajectories."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return
+
+    gamuon_r = next((r for r in results if r["label"] == "Gamuon" and r.get("norm_trajectories")), None)
+    conformal_r = next((r for r in results if r["label"] == "Gamuon+Conf" and r.get("norm_trajectories")), None)
+
+    if not gamuon_r or not conformal_r:
+        return
+
+    traj_gamuon = gamuon_r["norm_trajectories"]
+    traj_conf = conformal_r["norm_trajectories"]
+    layer_names = list(traj_gamuon[0]["layers"].keys())
+
+    n_layers = len(layer_names)
+    fig, axes = plt.subplots(n_layers, 2, figsize=(14, 2.5 * n_layers))
+    # Ensure axes is always 2D for consistent indexing
+    axes = axes.reshape(-1, 2)
+
+    colors = {"Gamuon (SGD)": "#4C72B0", "Gamuon+Conf": "#8E44AD"}
+
+    for i, layer_name in enumerate(layer_names):
+        gamuon_steps = [t["step"] for t in traj_gamuon]
+        conf_steps = [t["step"] for t in traj_conf]
+
+        # Gamma trajectory
+        ax = axes[i, 0]
+        ax.plot(gamuon_steps,
+                [t["layers"][layer_name]["gamma_mean"] for t in traj_gamuon],
+                "o-", color=colors["Gamuon (SGD)"], label="SGD", alpha=0.8, markersize=3)
+        ax.plot(conf_steps,
+                [t["layers"][layer_name]["gamma_mean"] for t in traj_conf],
+                "s-", color=colors["Gamuon+Conf"], label="ConformalMuon", alpha=0.8, markersize=3)
+        ax.set_xlabel("Step")
+        ax.set_ylabel("\u03b3 mean")
+        ax.set_title(f"{layer_name} — \u03b3 trajectory")
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+        # Beta trajectory
+        ax = axes[i, 1]
+        ax.plot(gamuon_steps,
+                [t["layers"][layer_name]["beta_mean"] for t in traj_gamuon],
+                "o-", color=colors["Gamuon (SGD)"], label="SGD", alpha=0.8, markersize=3)
+        ax.plot(conf_steps,
+                [t["layers"][layer_name]["beta_mean"] for t in traj_conf],
+                "s-", color=colors["Gamuon+Conf"], label="ConformalMuon", alpha=0.8, markersize=3)
+        ax.set_xlabel("Step")
+        ax.set_ylabel("\u03b2 mean")
+        ax.set_title(f"{layer_name} — \u03b2 trajectory")
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+    fig.suptitle(
+        "LayerNorm \u03b3/\u03b2 Trajectories  —  SGD vs ConformalMuon",
+        fontsize=14, fontweight="bold",
+    )
+    plt.tight_layout()
+
+    if save_path:
+        # Save as a separate file alongside the main plot
+        norms_plot_path = save_path.with_name("benchmark_norm_trajectories.pdf")
+        fig.savefig(norms_plot_path, dpi=150, bbox_inches="tight")
+        print(f"[benchmark] Norm trajectory plot saved to {norms_plot_path}")
+    else:
+        plt.show()
+
+    plt.close(fig)
 
 
 def plot_results(
@@ -595,6 +786,11 @@ def main():
         print(f"{'=' * 60}")
         model = make_model()
         opt = make_opt(model)
+
+        # Track norm trajectories for the two optimizers that treat
+        # norm layers differently (SGD vs ConformalMuon)
+        track_norms = label in ("Gamuon", "Gamuon+Conf")
+
         r = run_training(
             model, opt,
             steps=args.steps,
@@ -603,9 +799,14 @@ def main():
             seq_len=args.seq_len,
             device=device,
             label=label,
+            track_norms=track_norms,
+            norm_capture_interval=args.steps // 20,
         )
         results.append(r)
         print()
+
+    # ── Norm comparison table ──────────────────────────────────────
+    print_norm_comparison(results)
 
     # ── Summary ────────────────────────────────────────────────────
     print(f"{'=' * 60}")
@@ -632,6 +833,21 @@ def main():
             "min": min(r["step_times"]),
             "max": max(r["step_times"]),
         }
+        # Strip norm_trajectories from JSON (verbose, contains tensors)
+        # and replace with a lightweight summary
+        if r.get("norm_trajectories"):
+            traj = r["norm_trajectories"]
+            del entry["norm_trajectories"]
+            if len(traj) >= 2:
+                init_data = traj[0]["layers"]
+                final_data = traj[-1]["layers"]
+                entry["norm_trajectory_summary"] = {
+                    "n_captures": len(traj),
+                    "initial": {k: {"gamma_mean": v["gamma_mean"], "beta_mean": v["beta_mean"]}
+                                for k, v in init_data.items()},
+                    "final": {k: {"gamma_mean": v["gamma_mean"], "beta_mean": v["beta_mean"]}
+                              for k, v in final_data.items()},
+                }
         json_data.append(entry)
     with open(results_json, "w") as f:
         json.dump(json_data, f, indent=2)
@@ -641,6 +857,7 @@ def main():
     if not args.no_plot:
         plot_path = results_dir / "benchmark_plot.pdf"
         plot_results(results, save_path=plot_path)
+        plot_norm_trajectories(results, save_path=plot_path)
     else:
         print("[benchmark] Plotting disabled (--no-plot)")
 
