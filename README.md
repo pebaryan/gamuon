@@ -19,6 +19,7 @@
   - [Comparison with Muon](#comparison-with-muon)
   - [Clifford Algebra Signatures for Architectures](#clifford-algebra-signatures-for-architectures)
 - [Installation](#installation)
+- [Documentation](#documentation)
 - [Quick Start](#quick-start)
   - [Using GamuonAuto (recommended)](#using-gamuonauto-recommended)
   - [Using Gamuon Directly](#using-gamuon-directly)
