@@ -711,6 +711,27 @@ class ConformalMuon(torch.optim.Optimizer):
         For conformal parameter groups (pairs of 1‑D tensors), the
         update is the affine‑group exponential map.  Other groups
         receive plain SGD.
+
+        Parameters
+        ----------
+        closure : callable, optional
+            A closure that reevaluates the model and returns the loss.
+
+        Returns
+        -------
+        float or None
+            The loss from ``closure``, or ``None`` if no closure was given.
+
+        Example
+        -------
+        >>> model = nn.Sequential(nn.Linear(64, 64), nn.LayerNorm(64))
+        >>> opt = ConformalMuon(model, lr=1e-3)
+        >>>
+        >>> for x, y in dataloader:
+        ...     opt.zero_grad()
+        ...     loss = model(x).sum()
+        ...     loss.backward()
+        ...     opt.step()
         """
         loss = None
         if closure is not None:
