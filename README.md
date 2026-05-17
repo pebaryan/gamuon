@@ -226,6 +226,10 @@ based on its algebraic type:
 | 2-D weight matrices | `Gamuon` | Grade decomposition + rotor sandwich |
 | 1-D / other parameters | Plain SGD | Standard gradient descent |
 
+> **Full reference:** [`docs/gamuon_auto.md`](docs/gamuon_auto.md) — dedicated API
+> reference with parameter tables, advanced usage examples, checkpointing,
+> LR scheduling, AMP, and common Q&A.
+
 ### Using Gamuon Directly
 
 If you prefer to manage parameter groups yourself, use `Gamuon` directly:
@@ -474,6 +478,10 @@ dispatches each to the appropriate optimizer based on algebraic type.
 
 Public API matches `torch.optim.Optimizer`: `step()`, `zero_grad()`,
 `state_dict()`, `load_state_dict()`.
+
+> **See also:** [`docs/gamuon_auto.md`](docs/gamuon_auto.md) — dedicated API
+> reference with constructor parameters, dispatch logic, usage examples,
+> and checkpointing guide.
 
 ---
 
