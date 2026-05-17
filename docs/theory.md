@@ -50,6 +50,7 @@ conformal geometry.
    - [8.4 Stochastic Bivector Exponentials](#84-stochastic-bivector-exponentials)
    - [8.5 Higher-Grade Optimizers](#85-higher-grade-optimizers)
 - [References](#references)
+- [Further Reading](#further-reading)
 
 ---
 
