@@ -34,6 +34,8 @@ conformal geometry.
    - [6.1 Conformal Geometric Algebra Cl(4,1)](#61-conformal-geometric-algebra-cl41)
    - [6.2 LayerNorm as a Conformal Versor](#62-layernorm-as-a-conformal-versor)
    - [6.3 The Conformal Muon Principle](#63-the-conformal-muon-principle)
+   - [6.4 The Affine Group Exp Map](#64-the-affine-group-aff1-and-its-exponential-map)
+   - [6.5 The ConformalMuon Algorithm](#65-the-conformalmoun-optimizer-algorithm)
 7. [Comparison with Related Optimizers](#7-comparison-with-related-optimizers)
    - [7.1 Muon](#71-muon)
    - [7.2 Adam](#72-adam)
@@ -598,6 +600,322 @@ geometric optimizer correctly captures their non-Abelian nature.
 
 This is the natural extension of the Gamuon philosophy from the orthogonal group
 (weight matrices) to the conformal group (normalization layers).
+
+### 6.4 The Affine Group Aff(1) and Its Exponential Map
+
+While the full conformal group $\mathrm{Spin}(4,1)$ is high-dimensional, a
+normalization layer's learnable parameters $(\gamma, \beta)$ live in a
+**1-dimensional restriction**: the affine group of the real line.
+
+#### 6.4.1 The Affine Group Aff(1)
+
+**Definition.** The affine group $\mathrm{Aff}(1)$ is the set of invertible
+affine transformations of $\mathbb{R}$:
+
+$$x \mapsto \gamma x + \beta, \qquad \gamma \in \mathbb{R}^+, \; \beta \in \mathbb{R}$$
+
+It has a faithful $2 \times 2$ matrix representation:
+
+$$
+\begin{pmatrix} \gamma & \beta \\ 0 & 1 \end{pmatrix},
+\qquad \gamma > 0
+$$
+
+where composition is standard matrix multiplication:
+
+$$
+\begin{pmatrix} \gamma_2 & \beta_2 \\ 0 & 1 \end{pmatrix}
+\begin{pmatrix} \gamma_1 & \beta_1 \\ 0 & 1 \end{pmatrix}
+= \begin{pmatrix} \gamma_2 \gamma_1 & \gamma_2 \beta_1 + \beta_2 \\ 0 & 1 \end{pmatrix}
+$$
+
+This reveals the semidirect product structure $\mathbb{R} \rtimes \mathbb{R}^+$:
+dilations multiply, translations add, and they do **not** commute — applying
+$\gamma$ then $\beta$ differs from $\beta$ then $\gamma$ by the factor $\gamma$
+on the translation.
+
+#### 6.4.2 Lie Algebra of Aff(1)
+
+The Lie algebra $\mathfrak{aff}(1)$ is spanned by two generators:
+
+$$G_d = \begin{pmatrix} 1 & 0 \\ 0 & 0 \end{pmatrix}
+\quad\text{(dilation)},\qquad
+G_t = \begin{pmatrix} 0 & 1 \\ 0 & 0 \end{pmatrix}
+\quad\text{(translation)}$$
+
+Their commutator captures the non-Abelian nature:
+
+$$[G_d, G_t] = G_d G_t - G_t G_d = G_t$$
+
+This is the Lie bracket of the **ax + b** group — the $G_t$ translation
+generator is an eigenvector of $\mathrm{ad}_{G_d}$ with eigenvalue $+1$.
+
+Any element of the Lie algebra is parameterized by a dilation coefficient
+$a \in \mathbb{R}$ and a translation coefficient $b \in \mathbb{R}$:
+
+$$\Omega = a G_d + b G_t = \begin{pmatrix} a & b \\ 0 & 0 \end{pmatrix}$$
+
+#### 6.4.3 The Exponential Map exp: aff(1) → Aff(1)
+
+We seek the closed form of:
+
+$$\exp(\Omega) = \exp\begin{pmatrix} a & b \\ 0 & 0 \end{pmatrix}
+= \sum_{k=0}^\infty \frac{1}{k!} \begin{pmatrix} a & b \\ 0 & 0 \end{pmatrix}^k$$
+
+**Powers of Ω.** Compute the first few powers:
+
+$$
+\begin{aligned}
+\Omega^1 &= \begin{pmatrix} a & b \\ 0 & 0 \end{pmatrix} \\[4pt]
+\Omega^2 &= \begin{pmatrix} a & b \\ 0 & 0 \end{pmatrix}^2
+= \begin{pmatrix} a^2 & a b \\ 0 & 0 \end{pmatrix} \\[4pt]
+\Omega^3 &= \begin{pmatrix} a \cdot a^2 & a \cdot a b \\ 0 & 0 \end{pmatrix}
+= \begin{pmatrix} a^3 & a^2 b \\ 0 & 0 \end{pmatrix} \\[4pt]
+\Omega^k &= \begin{pmatrix} a^k & a^{k-1} b \\ 0 & 0 \end{pmatrix}
+\end{aligned}
+$$
+
+This pattern follows from the nilpotence of $G_t$ ($G_t^2 = 0$) and the
+diagonal structure of $G_d$.
+
+**Summing the series.** The upper-left entry is a standard exponential series:
+
+$$\sum_{k=0}^\infty \frac{a^k}{k!} = e^a$$
+
+The upper-right entry requires a more careful sum:
+
+$$
+\begin{aligned}
+\sum_{k=0}^\infty \frac{1}{k!} a^{k-1} b
+&= \frac{b}{a} \sum_{k=0}^\infty \frac{a^k}{k!} - \frac{b}{a} \cdot \frac{a^0}{0!} \\
+&= \frac{b}{a} (e^a - 1)
+\end{aligned}
+$$
+
+where the $k=0$ term is handled separately: $\Omega^0 = I$ has upper-right
+entry $0$, so the sum correctly starts at $k=1$. For $a = 0$, we use the
+limit $\frac{e^a - 1}{a} \to 1$, which gives the pure translation matrix.
+
+**Result.** The exponential map is:
+
+$$
+\boxed{\;\exp\begin{pmatrix} a & b \\ 0 & 0 \end{pmatrix}
+= \begin{pmatrix} e^a & b \cdot \frac{e^a - 1}{a} \\ 0 & 1 \end{pmatrix}\;}
+$$
+
+with the understanding that $\frac{e^a - 1}{a} \to 1$ when $a = 0$.
+
+#### 6.4.4 Action on (γ, β) Pairs
+
+The affine group acts on the parameter pair $(\gamma, \beta)$ by left
+multiplication of the group matrices:
+
+$$
+\begin{pmatrix} \gamma' & \beta' \\ 0 & 1 \end{pmatrix}
+= \exp(\Omega) \cdot \begin{pmatrix} \gamma & \beta \\ 0 & 1 \end{pmatrix}
+= \begin{pmatrix} e^a \cdot \gamma & e^a \cdot \beta + b \cdot \frac{e^a - 1}{a} \\ 0 & 1 \end{pmatrix}
+$$
+
+Extracting the two components gives the update rule implemented in
+:func:`_affine_exp`:
+
+$$
+\boxed{
+\begin{aligned}
+\gamma' &= \gamma \cdot e^a \\[4pt]
+\beta' &= e^a \cdot \beta + b \cdot \frac{e^a - 1}{a}
+\end{aligned}}
+$$
+
+**Key properties:**
+
+1. **Dilation is multiplicative:** $\gamma$ is always positive (a natural
+   constraint for normalization scales), and $e^a > 0$ preserves sign.
+
+2. **Translation is additive after dilation:** the $e^a$ factor on $\beta$
+   reflects the non-Abelian coupling — a dilation step also scales any
+   existing translation.
+
+3. **The semidirect product is respected:** $\gamma$ and $\beta$ are not
+   independent degrees of freedom; their geometric coupling is captured
+   exactly by the affine exponential.
+
+4. **Small-a limit is numerically stable:** when $a \approx 0$,
+   $\frac{e^a - 1}{a} \approx 1 + \frac{a}{2} + O(a^2)$, so the update
+   reduces to $\beta' \approx \beta + b$ — a pure translation.
+
+#### 6.4.5 Connection Back to CGA Cl(4,1)
+
+The affine group $\mathrm{Aff}(1)$ is isomorphic to the subgroup of the
+conformal group $\mathrm{Spin}(4,1)$ generated by:
+
+- **Dilation bivector:** $e_0 \wedge e_\infty$ (generates $G_d$)
+- **Translation null vector:** $e_\infty$ (generates $G_t$)
+
+Under this isomorphism, the matrix representation corresponds to the versor
+action on the homogeneous coordinates of the conformal embedding. The
+exponential map derived above is precisely the restriction of the
+Clifford-Lipschitz exponential $\exp: \mathfrak{spin}(4,1) \to \mathrm{Spin}(4,1)$
+to the 2-dimensional subalgebra spanned by $\{e_0 \wedge e_\infty, e_\infty\}$.
+
+### 6.5 The ConformalMuon Optimizer Algorithm
+
+With the affine-group exponential map in hand, we can build a complete
+optimizer for normalization layers that respects their geometric structure.
+The optimizer operates in three stages: (1) mapping Euclidean gradients to
+the Lie algebra, (2) accumulating momentum on the Lie algebra coordinates,
+and (3) applying the exponential map to update the parameters.
+
+#### 6.5.1 Mapping Gradients to the Lie Algebra
+
+Given a pair $(\gamma, \beta)$ with Euclidean gradients $g_\gamma, g_\beta$,
+we need the Lie algebra components $(g_a, g_b)$ of the gradient with respect
+to the affine-group parameterization.
+
+For a parameter $\theta$ with update $\theta' = \theta \cdot e^{\eta g_a}$
+(dilation coordinates), the standard chain rule gives:
+
+$$\frac{\partial \mathcal{L}}{\partial a}
+= \frac{\partial \mathcal{L}}{\partial \gamma'} \frac{\partial \gamma'}{\partial a}
+= g_\gamma \cdot \frac{\partial (\gamma e^a)}{\partial a}\bigg|_{a=0}
+= g_\gamma \cdot \gamma e^a \big|_{a=0}
+= \gamma \cdot g_\gamma$$
+
+Thus the Lie algebra dilation gradient is:
+
+$$\boxed{g_a = \gamma \odot g_\gamma}$$
+
+where $\odot$ is elementwise multiplication. The translation gradient is
+directly the Euclidean gradient of $\beta$:
+
+$$g_b = g_\beta$$
+
+#### 6.5.2 Momentum on the Lie Algebra
+
+The optimizer maintains Adam-style exponential moving averages on the
+Lie algebra coordinates $(a, b)$ rather than on the raw $(\gamma, \beta)$
+parameters:
+
+$$
+\begin{aligned}
+m_a^{(t)} &= \beta_1 m_a^{(t-1)} + (1 - \beta_1) g_a^{(t)} \\
+v_a^{(t)} &= \beta_2 v_a^{(t-1)} + (1 - \beta_2) (g_a^{(t)})^2 \\[4pt]
+m_b^{(t)} &= \beta_1 m_b^{(t-1)} + (1 - \beta_1) g_b^{(t)} \\
+v_b^{(t)} &= \beta_2 v_b^{(t-1)} + (1 - \beta_2) (g_b^{(t)})^2
+\end{aligned}
+$$
+
+With bias correction:
+
+$$
+\hat{m}_a = \frac{m_a}{1 - \beta_1^t}, \quad
+\hat{v}_a = \frac{v_a}{1 - \beta_2^t}, \quad
+\hat{m}_b = \frac{m_b}{1 - \beta_1^t}, \quad
+\hat{v}_b = \frac{v_b}{1 - \beta_2^t}
+$$
+
+#### 6.5.3 Lie Algebra Step
+
+The Lie algebra step is the standard Adam normalisation:
+
+$$
+a = -\eta \cdot \frac{\hat{m}_a}{\sqrt{\hat{v}_a} + \epsilon}, \qquad
+b = -\eta \cdot \frac{\hat{m}_b}{\sqrt{\hat{v}_b} + \epsilon}
+$$
+
+The negative sign ensures gradient descent (rather than ascent).
+
+#### 6.5.4 Affine Exponential Update
+
+The step $(a, b)$ is integrated into the parameter pair via the affine
+group exponential:
+
+$$
+\begin{aligned}
+\delta_\gamma &= e^a \\
+\delta_\beta &= b \cdot \frac{e^a - 1}{a} \quad\text{(with small-a limit)}\\[8pt]
+\gamma' &= \gamma \cdot \delta_\gamma \\
+\beta' &= \delta_\gamma \cdot \beta + \delta_\beta
+\end{aligned}
+$$
+
+#### 6.5.5 Complete Algorithm
+
+```
+Algorithm: ConformalMuon step for (γ, β) pair
+────────────────────────────────────────────────────────────
+Require: Learning rate η, betas (β₁, β₂), eps ε
+Require: Current parameters (γ, β), Euclidean gradients (g_γ, g_β)
+Require: State (step t, momentum buffers)
+
+ 1:  g_γ ← g_γ + λ·γ                         ▷ weight decay (if λ > 0)
+ 2:  g_β ← g_β + λ·β                         ▷ weight decay
+ 3:  g_a ← γ ⊙ g_γ                            ▷ Lie algebra dilation gradient
+ 4:  g_b ← g_β                                ▷ Lie algebra translation gradient
+ 5:  m_a ← β₁·m_a + (1-β₁)·g_a               ▷ first moment (dilation)
+ 6:  v_a ← β₂·v_a + (1-β₂)·g_a²             ▷ second moment (dilation)
+ 7:  m_b ← β₁·m_b + (1-β₁)·g_b               ▷ first moment (translation)
+ 8:  v_b ← β₂·v_b + (1-β₂)·g_b²             ▷ second moment (translation)
+ 9:  t ← t + 1
+10:  a ← -η · m_a/(1-β₁ᵗ) / (√(v_a/(1-β₂ᵗ)) + ε)   ▷ bias-corrected step
+11:  b ← -η · m_b/(1-β₁ᵗ) / (√(v_b/(1-β₂ᵗ)) + ε)
+12:  δ_γ ← exp(a)                             ▷ affine exponential
+13:  trans ← b · (exp(a)-1)/a                 ▷ (limit 1 when a=0)
+14:  γ ← γ · δ_γ                              ▷ multiplicative dilation
+15:  β ← δ_γ · β + trans                      ▷ coupled translation
+────────────────────────────────────────────────────────────
+```
+
+#### 6.5.6 Auto-Detection of Conformal Pairs
+
+In practice, the optimizer needs to discover which parameters form conformal
+$(\gamma, \beta)$ pairs. The :func:`find_conformal_pairs` utility scans all
+submodules of a model and returns pairs for every normalization layer:
+
+```python
+def find_conformal_pairs(model, types=None):
+    """Returns list of (weight, bias) tuples for norm layers."""
+    if types is None:
+        types = (nn.LayerNorm, nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)
+    pairs = []
+    for module in model.modules():
+        if isinstance(module, types):
+            w = getattr(module, "weight", None)
+            b = getattr(module, "bias", None)
+            if w is not None:
+                pairs.append((w, b) if b is not None else (w, None))
+    return pairs
+```
+
+Detection cascades through all submodules and works for any layer with
+$\gamma$ (weight) and optional $\beta$ (bias) 1-D parameters.
+
+#### 6.5.7 Parameter Group Configuration
+
+The :class:`ConformalMuon` optimizer accepts three modes of parameter
+specification:
+
+1. **Module auto-detection** — pass an `nn.Module` directly; conformal pairs
+   are detected automatically, and remaining parameters receive SGD fallback.
+
+2. **Tuple list** — pass a list of `(weight, bias)` tuples from
+   `find_conformal_pairs`, giving explicit control over which pairs are
+   treated conformally.
+
+3. **Standard param groups** — pass standard PyTorch param groups with an
+   optional `"is_conformal": True` flag; groups without this flag receive
+   SGD fallback.
+
+#### 6.5.8 Comparison: ConformalMuon vs Adam for Norm Layers
+
+| Aspect | Adam | ConformalMuon |
+|---|---|---|
+| Geometry | Euclidean (flat) | Affine group Aff(1) (curved) |
+| Dilation update | Additive: $\gamma \leftarrow \gamma - \eta \cdot \hat{m}_\gamma$ | Multiplicative: $\gamma \leftarrow \gamma \cdot e^{-\eta \cdot \hat{m}_a}$ |
+| Translation update | $\beta \leftarrow \beta - \eta \cdot \hat{m}_\beta$ | Coupled: $\beta \leftarrow e^a \cdot \beta + b \cdot (e^a-1)/a$ |
+| Parameter coupling | None (independent) | Full (semidirect product) |
+| $\gamma$ sign guaranteed | ❌ (can become negative) | ✅ ($e^a > 0$) |
+| Momentum | Parameter-space EMA | Lie-algebra EMA |
 
 ---
 
