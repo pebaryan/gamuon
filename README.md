@@ -466,7 +466,7 @@ If you use Gamuon in your research, please cite:
 
 ```bibtex
 @software{gamuon2025,
-  author = {Pebryan},
+  author = {Peb Ruswono Aryan},
   title = {Gamuon: Geometric (Clifford) Algebra-native Optimizer},
   year = {2025},
   url = {https://github.com/pebaryan/gamuon}
