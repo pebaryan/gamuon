@@ -72,17 +72,20 @@ works *with* the geometry, so every update is meaningful.
 
 ## Quick Start
 
-Using Gamuon is almost identical to using Adam:
+The simplest way to use Gamuon is via `GamuonAuto` — pass it your model and it
+automatically figures out the right optimizer for every parameter:
 
 ```python
 import torch
-from gamuon import Gamuon
+from gamuon import GamuonAuto
 
-# Your model (works best with square weight matrices)
-model = torch.nn.Linear(512, 512)
+model = torch.nn.Sequential(
+    torch.nn.Linear(512, 512),
+    torch.nn.LayerNorm(512),
+)
 
-# Gamuon as a drop-in replacement for Adam
-optimizer = Gamuon(model.parameters(), lr=1e-3)
+# One-shot auto optimizer — detects norm layers, 2D matrices, and other params
+optimizer = GamuonAuto(model, lr=1e-3)
 
 # Standard training loop — nothing else changes
 for x, y in dataloader:
@@ -92,8 +95,36 @@ for x, y in dataloader:
     optimizer.step()
 ```
 
-That's it. Same API as `torch.optim.Adam`. Same hyperparameters (`lr`,
-`betas`, `eps`, `weight_decay`).
+Under the hood, `GamuonAuto` partitions your model's parameters into three
+groups and dispatches each to the best optimizer:
+
+| Parameter type | Optimizer | What it does |
+|---|---|---|
+| **Norm-layer (\u03b3, \u03b2) pairs** | `ConformalMuon` | Affine-group exponential (keeping \u03b3 positive) |
+| **2-D weight matrices** | `Gamuon` | Grade decomposition + rotor update |
+| **1-D / other params** | Plain SGD | Standard gradient descent |
+
+Same API as `torch.optim.Adam`. Same hyperparameters (`lr`, `betas`, `eps`,
+`weight_decay`). It just works.
+
+### Advanced: Using Gamuon directly
+
+If you prefer to manage the partitioning yourself (for custom parameter groups
+or per-grade learning rates), you can still use `Gamuon` directly:
+
+```python
+from gamuon import Gamuon
+
+optimizer = Gamuon(model.parameters(), lr=1e-3, lr_bivector=2.0)
+```
+
+> **Note:** `Gamuon` only applies the grade-decomposition update to 2-D weight
+> matrices. Norm-layer (\u03b3, \u03b2) parameters are silently skipped since they
+> are 1-D. If your model has norm layers (most do), use `GamuonAuto` instead to
+> get the full `ConformalMuon` treatment for them.
+
+But for most users and most models, **`GamuonAuto` is the recommended starting
+point**.
 
 ---
 
@@ -102,9 +133,13 @@ That's it. Same API as `torch.optim.Adam`. Same hyperparameters (`lr`,
 | Use this... | When... |
 |---|---|
 | **Adam** | You want the safe, universal default. Works well everywhere. |
-| **Gamuon** | You have many **square or nearly-square weight matrices** (transformers, MLPs). You're willing to trade a bit of speed-per-step for potentially faster convergence. |
+| **GamuonAuto** | You want the simplest all-in-one setup. Auto-detects norm layers, 2D matrices, and other params — one call, done. **Recommended for most users.** |
+| **Gamuon** | You have many **square or nearly-square weight matrices** and want per-grade control (e.g., tuning `lr_bivector`). |
 | **Muon (standard)** | You want the latest research optimizer for LLMs. Uses Newton-Schulz iterations instead of exact math. |
-| **Gamuon+Conf** | You want both Gamuon for weight matrices **and** ConformalMuon for LayerNorm parameters (see below). |
+| **ConformalMuon** | You only want to optimise norm-layer (\u03b3, \u03b2) parameters. |
+
+> **Tip:** See the table under [Quick Start](#quick-start) for how `GamuonAuto`
+> maps parameter types to optimisers.
 
 ### Practical guidance
 
@@ -224,21 +259,32 @@ Standard Adam treats γ and β independently — they each get their own learnin
 rate and update. But γ (scale) and β (shift) are **geometrically coupled**:
 applying γ then β is different from applying β then γ.
 
-ConformalMuon respects this coupling:
+ConformalMuon respects this coupling. The easiest way to use it (along with
+Gamuon for weight matrices) is `GamuonAuto`:
+
+```python
+from gamuon import GamuonAuto
+
+# Single call — auto-detects everything
+optimizer = GamuonAuto(model, lr=1e-3)
+```
+
+Or use `ConformalMuon` directly if you only want to optimise norm layers:
 
 ```python
 from gamuon import ConformalMuon
 
 # Auto-detect all norm layers in your model
 optimizer = ConformalMuon(model, lr=1e-3)
+```
 
-# Or combine with Gamuon for weight matrices
-from gamuon import CombinedOptimizer, find_conformal_pairs
+For fine-grained control, you can also pass explicit (\u03b3, \u03b2) pairs:
+
+```python
+from gamuon import ConformalMuon, find_conformal_pairs
 
 pairs = find_conformal_pairs(model)
-conf_opt = ConformalMuon(pairs, lr=1e-3)
-gam_opt = Gamuon(model.parameters(), lr=1e-3)
-optimizer = CombinedOptimizer([gam_opt, conf_opt])
+optimizer = ConformalMuon(pairs, lr=1e-3)
 ```
 
 **What ConformalMuon does differently:**
@@ -262,23 +308,23 @@ a standard deviation.
 The recommended setup for transformer training:
 
 ```python
-from gamuon import (
-    Gamuon, ConformalMuon, CombinedOptimizer,
-    find_conformal_pairs,
-)
+from gamuon import GamuonAuto
 
-# 1. Gamuon for all 2-D weight matrices
-matrix_optimizer = Gamuon(model.parameters(), lr=1e-3)
+# Single call — everything is auto-detected and optimised
+optimizer = GamuonAuto(model, lr=1e-3)
 
-# 2. ConformalMuon for norm layers
-pairs = find_conformal_pairs(model)
-norm_optimizer = ConformalMuon(pairs, lr=1e-3)
-
-# 3. Combined
-optimizer = CombinedOptimizer([matrix_optimizer, norm_optimizer])
+# Standard training loop
+for x, y in dataloader:
+    optimizer.zero_grad()
+    loss = (model(x) - y).pow(2).mean()
+    loss.backward()
+    optimizer.step()
 ```
 
-This is what the "Gamuon+Conf" entry in the benchmark does.
+`GamuonAuto` is what the "Gamuon+Conf" entry in the benchmark uses. It
+automatically calls `find_conformal_pairs` under the hood, applies
+`ConformalMuon` to norm-layer params, `Gamuon` to 2-D weight matrices, and
+plain SGD to everything else.
 
 ---
 
