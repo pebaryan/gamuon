@@ -83,11 +83,15 @@ class CausalSelfAttention(nn.Module):
 class TransformerBlock(nn.Module):
     """Pre-norm transformer block."""
 
-    def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1):
+    def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1, norm_type: str = "layernorm"):
         super().__init__()
-        self.ln1 = nn.LayerNorm(d_model)
+        if norm_type == "rmsnorm":
+            self.ln1 = nn.RMSNorm(d_model)
+            self.ln2 = nn.RMSNorm(d_model)
+        else:
+            self.ln1 = nn.LayerNorm(d_model)
+            self.ln2 = nn.LayerNorm(d_model)
         self.attn = CausalSelfAttention(d_model, dropout)
-        self.ln2 = nn.LayerNorm(d_model)
         self.ff = nn.Sequential(
             nn.Linear(d_model, d_ff),
             nn.GELU(),
@@ -113,15 +117,20 @@ class SmallTransformer(nn.Module):
         n_layers: int = 3,
         max_len: int = 64,
         dropout: float = 0.1,
+        norm_type: str = "layernorm",
     ):
         super().__init__()
+        self.norm_type = norm_type
         self.token_emb = nn.Embedding(vocab_size, d_model)
         self.pos_enc = SinusoidalEmbedding(d_model, max_len)
         self.dropout = nn.Dropout(dropout)
         self.blocks = nn.ModuleList([
-            TransformerBlock(d_model, d_ff, dropout) for _ in range(n_layers)
+            TransformerBlock(d_model, d_ff, dropout, norm_type) for _ in range(n_layers)
         ])
-        self.ln_f = nn.LayerNorm(d_model)
+        if norm_type == "rmsnorm":
+            self.ln_f = nn.RMSNorm(d_model)
+        else:
+            self.ln_f = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size)
 
         # Causal mask
@@ -274,39 +283,55 @@ def get_param_groups(model: nn.Module, lr: float) -> list[dict]:
     return groups
 
 
-def extract_norm_params(model: nn.Module) -> dict[str, tuple[float, float]]:
-    """Extract LayerNorm (γ, β) mean values from a model.
+def _norm_layers(model: nn.Module) -> list[tuple[str, nn.Module]]:
+    """Return (name, module) pairs for all norm layers (LayerNorm or RMSNorm)."""
+    out = []
+    for name, mod in model.named_modules():
+        if isinstance(mod, (nn.LayerNorm, nn.RMSNorm)):
+            out.append((name, mod))
+    return out
 
+
+def extract_norm_params(model: nn.Module) -> dict[str, tuple[float, float]]:
+    """Extract norm layer (γ, β) mean values from a model.
+
+    For RMSNorm, beta is reported as 0.0 (no bias parameter).
     Returns a dict mapping layer name → (gamma_mean, beta_mean).
     """
     params = {}
-    for name, mod in model.named_modules():
-        if isinstance(mod, nn.LayerNorm):
-            gamma = mod.weight.data.mean().item() if mod.weight is not None else 0.0
-            beta = mod.bias.data.mean().item() if mod.bias is not None else 0.0
-            params[name] = (gamma, beta)
+    for name, mod in _norm_layers(model):
+        gamma = mod.weight.data.mean().item() if mod.weight is not None else 0.0
+        if isinstance(mod, nn.LayerNorm) and mod.bias is not None:
+            beta = mod.bias.data.mean().item()
+        else:
+            beta = 0.0
+        params[name] = (gamma, beta)
     return params
 
 
 def extract_norm_tensors(model: nn.Module) -> dict[str, dict]:
-    """Extract full (γ, β) tensors from LayerNorm layers, plus their means.
+    """Extract full (γ, β) tensors from norm layers, plus their means.
 
-    Returns a dict mapping layer name → {"gamma": tensor, "beta": tensor,
-    "gamma_mean": float, "beta_mean": float}.
+    For RMSNorm, beta is None and beta_mean is 0.0.
+    Returns a dict mapping layer name → {"gamma": tensor, "beta": tensor | None,
+    "gamma_mean": float, "beta_mean": float, "norm_type": str}.
     """
     data = {}
-    for name, mod in model.named_modules():
-        if isinstance(mod, nn.LayerNorm):
-            g = mod.weight.data.detach().clone() if mod.weight is not None else None
-            b = mod.bias.data.detach().clone() if mod.bias is not None else None
-            data[name] = {
-                "gamma": g,
-                "beta": b,
-                "gamma_mean": g.mean().item() if g is not None else 0.0,
-                "beta_mean": b.mean().item() if b is not None else 0.0,
-                "gamma_norm": g.norm().item() if g is not None else 0.0,
-                "beta_norm": b.norm().item() if b is not None else 0.0,
-            }
+    for name, mod in _norm_layers(model):
+        g = mod.weight.data.detach().clone() if mod.weight is not None else None
+        if isinstance(mod, nn.LayerNorm) and hasattr(mod, "bias") and mod.bias is not None:
+            b = mod.bias.data.detach().clone()
+        else:
+            b = None
+        data[name] = {
+            "gamma": g,
+            "beta": b,
+            "gamma_mean": g.mean().item() if g is not None else 0.0,
+            "beta_mean": b.mean().item() if b is not None else 0.0,
+            "gamma_norm": g.norm().item() if g is not None else 0.0,
+            "beta_norm": b.norm().item() if b is not None else 0.0,
+            "norm_type": "RMSNorm" if isinstance(mod, nn.RMSNorm) else "LayerNorm",
+        }
     return data
 
 
@@ -325,7 +350,7 @@ def run_training(
 ) -> dict:
     """Run training and return loss history + timing data.
 
-    If track_norms is True, snapshots of LayerNorm (γ, β) mean values
+    If track_norms is True, snapshots of norm-layer (γ, β) mean values
     are recorded every norm_capture_interval steps.
     """
     model.train()
@@ -392,13 +417,14 @@ def run_training(
 
 
 def print_norm_comparison(results: list[dict]):
-    """Print a comparison table of LayerNorm γ/β trajectories.
+    """Print a comparison table of norm-layer γ/β trajectories.
 
     Compares the two norm-update strategies used in this benchmark:
     - Gamuon (uses SGD for norm-layer params)
     - Gamuon+Conf (uses ConformalMuon for norm-layer params)
 
-    Prints initial → final values for each LayerNorm layer.
+    Prints initial → final values for each norm layer.
+    Supports both LayerNorm (γ + β) and RMSNorm (γ only).
     """
     # Find Gamuon and Gamuon+Conf results with norm trajectories
     gamuon_r = next((r for r in results if r["label"] == "Gamuon" and r.get("norm_trajectories")), None)
@@ -412,43 +438,66 @@ def print_norm_comparison(results: list[dict]):
     sgd_final = gamuon_r["norm_trajectories"][-1]["layers"]
     conf_final = conformal_r["norm_trajectories"][-1]["layers"]
 
-    print(f"{'=' * 85}")
-    print("  LayerNorm \u03b3/\u03b2  —  ConformalMuon vs SGD")
-    print(f"{'=' * 85}")
-    header = (
-        f"{'Layer':<22} {'\u03b3 init':<10} {'\u03b3 SGD':<10} {'\u03b3 Conf':<10}"
-        f" {'\u03b2 init':<10} {'\u03b2 SGD':<10} {'\u03b2 Conf':<10}"
-    )
+    # Detect norm type from first layer
+    first_key = list(init_layers.keys())[0]
+    norm_type = init_layers[first_key].get("norm_type", "LayerNorm")
+    has_beta = norm_type == "LayerNorm" and init_layers[first_key].get("beta") is not None
+
+    if has_beta:
+        header_lbl = f"{norm_type} \u03b3/\u03b2"
+        header = (
+            f"{'Layer':<26} {'\u03b3 init':<10} {'\u03b3 SGD':<10} {'\u03b3 Conf':<10}"
+            f" {'\u03b2 init':<10} {'\u03b2 SGD':<10} {'\u03b2 Conf':<10}"
+        )
+        sep = "-" * 89
+    else:
+        header_lbl = f"{norm_type} \u03b3 (no bias)"
+        header = (
+            f"{'Layer':<26} {'\u03b3 init':<10} {'\u03b3 SGD':<10} {'\u03b3 Conf':<10}"
+        )
+        sep = "-" * 59
+
+    print(f"{'=' * max(len(header), 60)}")
+    print(f"  {header_lbl}  —  ConformalMuon vs SGD")
+    print(f"{'=' * max(len(header), 60)}")
     print(header)
-    print("-" * 85)
+    print(sep)
 
     for layer_name in init_layers:
         init = init_layers[layer_name]
         sgd = sgd_final.get(layer_name, {})
         conf = conf_final.get(layer_name, {})
-        print(
-            f"{layer_name:<22} "
-            f"{init['gamma_mean']:<10.4f} {sgd.get('gamma_mean', 0):<10.4f} {conf.get('gamma_mean', 0):<10.4f} "
-            f"{init['beta_mean']:<10.4f} {sgd.get('beta_mean', 0):<10.4f} {conf.get('beta_mean', 0):<10.4f}"
-        )
+        if has_beta:
+            print(
+                f"{layer_name:<26} "
+                f"{init['gamma_mean']:<10.4f} {sgd.get('gamma_mean', 0):<10.4f} {conf.get('gamma_mean', 0):<10.4f} "
+                f"{init['beta_mean']:<10.4f} {sgd.get('beta_mean', 0):<10.4f} {conf.get('beta_mean', 0):<10.4f}"
+            )
+        else:
+            print(
+                f"{layer_name:<26} "
+                f"{init['gamma_mean']:<10.4f} {sgd.get('gamma_mean', 0):<10.4f} {conf.get('gamma_mean', 0):<10.4f}"
+            )
 
     # Summary statistics
-    print("-" * 85)
-    # Compute gamma norms
+    print(sep)
     sgd_gamma_norm = sum(sgd_final[ln]["gamma_norm"] for ln in sgd_final)
     conf_gamma_norm = sum(conf_final[ln]["gamma_norm"] for ln in conf_final)
-    sgd_beta_norm = sum(abs(sgd_final[ln]["beta_mean"]) for ln in sgd_final)
-    conf_beta_norm = sum(abs(conf_final[ln]["beta_mean"]) for ln in conf_final)
-
-    print(f"{'Total \u03b3 \u2113\u2082':<22} {'':<10}"
-          f"{sgd_gamma_norm:<10.4f} {conf_gamma_norm:<10.4f} {'':<21}")
-    print(f"{'Total |\u03b2| mean':<22} {'':<10}"
-          f"{sgd_beta_norm:<10.4f} {conf_beta_norm:<10.4f} {'':<21}")
+    print(f"{'Total \u03b3 \u2113\u2082':<26} {'':<10}"
+          f"{sgd_gamma_norm:<10.4f} {conf_gamma_norm:<10.4f}")
+    if has_beta:
+        sgd_beta_norm = sum(abs(sgd_final[ln]["beta_mean"]) for ln in sgd_final)
+        conf_beta_norm = sum(abs(conf_final[ln]["beta_mean"]) for ln in conf_final)
+        print(f"{'Total |\u03b2| mean':<26} {'':<10}"
+              f"{sgd_beta_norm:<10.4f} {conf_beta_norm:<10.4f}")
     print()
 
 
 def plot_norm_trajectories(results: list[dict], save_path: Optional[Path] = None):
-    """Generate a separate figure showing LayerNorm \u03b3/\u03b2 trajectories."""
+    """Generate a separate figure showing norm-layer \u03b3/\u03b2 trajectories.
+
+    Supports both LayerNorm (\u03b3 + \u03b2) and RMSNorm (\u03b3 only).
+    """
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -466,10 +515,21 @@ def plot_norm_trajectories(results: list[dict], save_path: Optional[Path] = None
     traj_conf = conformal_r["norm_trajectories"]
     layer_names = list(traj_gamuon[0]["layers"].keys())
 
+    # Detect norm type from first layer
+    first_layer = traj_gamuon[0]["layers"][layer_names[0]]
+    norm_type = first_layer.get("norm_type", "LayerNorm")
+    has_beta = norm_type == "LayerNorm" and first_layer.get("beta") is not None
+
     n_layers = len(layer_names)
-    fig, axes = plt.subplots(n_layers, 2, figsize=(14, 2.5 * n_layers))
+    n_cols = 2 if has_beta else 1
+    fig, axes = plt.subplots(n_layers, n_cols, figsize=(14 if has_beta else 8, 2.5 * n_layers))
     # Ensure axes is always 2D for consistent indexing
-    axes = axes.reshape(-1, 2)
+    if n_layers == 1 and n_cols == 1:
+        axes = axes.reshape(1, 1)
+    elif n_layers == 1:
+        axes = axes.reshape(1, -1)
+    else:
+        axes = axes.reshape(-1, n_cols)
 
     colors = {"Gamuon (SGD)": "#4C72B0", "Gamuon+Conf": "#8E44AD"}
 
@@ -491,29 +551,31 @@ def plot_norm_trajectories(results: list[dict], save_path: Optional[Path] = None
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
 
-        # Beta trajectory
-        ax = axes[i, 1]
-        ax.plot(gamuon_steps,
-                [t["layers"][layer_name]["beta_mean"] for t in traj_gamuon],
-                "o-", color=colors["Gamuon (SGD)"], label="SGD", alpha=0.8, markersize=3)
-        ax.plot(conf_steps,
-                [t["layers"][layer_name]["beta_mean"] for t in traj_conf],
-                "s-", color=colors["Gamuon+Conf"], label="ConformalMuon", alpha=0.8, markersize=3)
-        ax.set_xlabel("Step")
-        ax.set_ylabel("\u03b2 mean")
-        ax.set_title(f"{layer_name} — \u03b2 trajectory")
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
+        # Beta trajectory (only for LayerNorm)
+        if has_beta:
+            ax = axes[i, 1]
+            ax.plot(gamuon_steps,
+                    [t["layers"][layer_name]["beta_mean"] for t in traj_gamuon],
+                    "o-", color=colors["Gamuon (SGD)"], label="SGD", alpha=0.8, markersize=3)
+            ax.plot(conf_steps,
+                    [t["layers"][layer_name]["beta_mean"] for t in traj_conf],
+                    "s-", color=colors["Gamuon+Conf"], label="ConformalMuon", alpha=0.8, markersize=3)
+            ax.set_xlabel("Step")
+            ax.set_ylabel("\u03b2 mean")
+            ax.set_title(f"{layer_name} — \u03b2 trajectory")
+            ax.legend(fontsize=8)
+            ax.grid(True, alpha=0.3)
 
     fig.suptitle(
-        "LayerNorm \u03b3/\u03b2 Trajectories  —  SGD vs ConformalMuon",
+        f"{norm_type} \u03b3" + ("\u03b2" if has_beta else "") +
+        " Trajectories  —  SGD vs ConformalMuon",
         fontsize=14, fontweight="bold",
     )
     plt.tight_layout()
 
     if save_path:
-        # Save as a separate file alongside the main plot
-        norms_plot_path = save_path.with_name("benchmark_norm_trajectories.pdf")
+        suffix = "_rmsnorm" if norm_type == "RMSNorm" else ""
+        norms_plot_path = save_path.with_name(f"benchmark_norm_trajectories{suffix}.pdf")
         fig.savefig(norms_plot_path, dpi=150, bbox_inches="tight")
         print(f"[benchmark] Norm trajectory plot saved to {norms_plot_path}")
     else:
@@ -660,6 +722,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cpu", action="store_true",
                         help="Force CPU even if CUDA is available")
+    parser.add_argument("--rmsnorm", action="store_true",
+                        help="Use RMSNorm instead of LayerNorm for all norm layers")
     args = parser.parse_args()
 
     device = torch.device(
@@ -671,6 +735,7 @@ def main():
     print(f"[benchmark] Data: vocab={args.vocab_size}, "
           f"batch={args.batch_size}, seq_len={args.seq_len}")
     print(f"[benchmark] Steps: {args.steps}, LR: {args.lr}, Seed: {args.seed}")
+    print(f"[benchmark] Norm type: {'RMSNorm' if args.rmsnorm else 'LayerNorm'}")
     print()
 
     torch.manual_seed(args.seed)
@@ -684,6 +749,7 @@ def main():
             d_ff=args.d_ff,
             n_layers=args.n_layers,
             max_len=args.seq_len + 1,
+            norm_type="rmsnorm" if args.rmsnorm else "layernorm",
         ).to(device)
 
     # ── Define optimizers ──────────────────────────────────────────
