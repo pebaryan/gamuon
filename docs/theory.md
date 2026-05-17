@@ -1258,6 +1258,19 @@ becomes more complex.
 
 ---
 
+## Further Reading
+
+- **[`docs/intuitive_guide.md`](intuitive_guide.md)** — A gentle, example-driven introduction to
+  geometric algebra concepts. Start here if the mathematical treatment in this document
+  feels overwhelming.
+- **[`docs/gamuon_auto.md`](gamuon_auto.md)** — Dedicated API reference for `GamuonAuto` with
+  parameter descriptions, usage examples (checkpointing, LR scheduling, AMP), and
+  answers to common questions.
+- **[`README.md`](../README.md)** — Project overview with quick-start guide, installation
+  instructions, and benchmark results.
+
+---
+
 > *This document is a living theoretical companion to the Gamuon implementation.
 > Corrections, extensions, and open questions are welcome as GitHub issues or
 > pull requests.*
