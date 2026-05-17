@@ -50,6 +50,8 @@ Gamuon is a drop-in optimizer for PyTorch that replaces the Newton–Schulz iter
 
 The result is a geometrically principled optimizer that respects the **Lie group structure** of neural network weight spaces.
 
+> **A note on exactness:** For 2×2 and 3×3 matrices, the rotor exponential uses closed-form formulas. For n≥4, `torch.matrix_exp` is used internally, which itself uses iterative Padé approximation — so the rotor is numerically accurate but not algebraically exact for larger matrices.
+
 ---
 
 ## Theoretical Overview
@@ -97,7 +99,7 @@ This is the **unique grade-preserving action** of the Clifford group on multivec
 | Property | Why it matters |
 |---|---|
 | **Norm-preserving** | $\|W'\|_F = \|W\|_F$ (rotor part only) |
-| **Spectrum-preserving** | Eigenvalues of $W$ are rotated, not rescalled |
+| **Spectrum-preserving** | Eigenvalues of $W$ are rotated, not rescaled |
 | **Group action** | $(R_2 R_1) \cdot W \cdot (R_2 R_1)^\mathsf{T} = R_2 \cdot (R_1 \cdot W \cdot R_1^\mathsf{T}) \cdot R_2^\mathsf{T}$ |
 
 The full Gamuon update combines all three grades:
@@ -153,11 +155,15 @@ Different neural network layers naturally inhabit different Clifford algebras:
 
 ## Installation
 
+**Requirements:** Python 3.10+, PyTorch 2.0+
+
+### Install from PyPI (coming soon)
+
 ```bash
 pip install gamuon
 ```
 
-Or install from source:
+### Install from source
 
 ```bash
 git clone https://github.com/pebaryan/gamuon.git
@@ -165,7 +171,19 @@ cd gamuon
 pip install -e .
 ```
 
-**Requirements:** Python 3.10+, PyTorch 2.0+
+### Installed with PyTorch
+
+Since PyTorch is platform-specific (CPU/CUDA/ROCm/MPS), it is **not** listed as a hard dependency. Install PyTorch 2.0+ following the [official guide](https://pytorch.org/get-started/locally/), then:
+
+```bash
+pip install gamuon[torch]
+```
+
+Or install everything at once:
+
+```bash
+pip install -e .[torch,dev]  # includes test dependencies
+```
 
 ---
 
