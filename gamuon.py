@@ -1110,6 +1110,30 @@ class GamuonAuto:
         """Return the state of all sub-optimisers as a nested dict.
 
         Compatible with ``torch.save`` / ``torch.load`` for checkpointing.
+        Missing sub-optimisers (those with no parameters) are stored as
+        empty dicts ``{}`` so the three-key structure is always preserved.
+
+        Returns
+        -------
+        dict
+            Nested dict with keys ``"conformal"``, ``"gamuon"``,
+            ``"sgd"``, each mapping to the corresponding sub-optimiser's
+            state dict (or ``{}`` if the sub-optimiser is not active).
+
+        Example
+        -------
+        >>> opt = GamuonAuto(model, lr=1e-3)
+        >>>
+        >>> # Save checkpoint
+        >>> torch.save({
+        ...     "model_state": model.state_dict(),
+        ...     "optimizer_state": opt.state_dict(),
+        ... }, "checkpoint.pt")
+        >>>
+        >>> # Inspect saved keys
+        >>> sd = opt.state_dict()
+        >>> list(sd.keys())
+        ['conformal', 'gamuon', 'sgd']
         """
         return {
             "conformal": self._conformal.state_dict() if self._conformal else {},
@@ -1118,7 +1142,35 @@ class GamuonAuto:
         }
 
     def load_state_dict(self, state_dict: dict) -> None:
-        """Load a previously saved state dict."""
+        """Load a previously saved state dict.
+
+        Restores the state of each active sub-optimiser from the
+        corresponding key in *state_dict*.  Keys for sub-optimisers
+        that are not present in this ``GamuonAuto`` instance are
+        silently skipped, allowing partial restoration (e.g. loading
+        only the conformal sub-optimiser's state).
+
+        Parameters
+        ----------
+        state_dict : dict
+            A dict with the same three-key structure produced by
+            :meth:`state_dict`.  Only the keys matching active
+            sub-optimisers are consumed; extra or missing keys
+            are ignored without error.
+
+        Example
+        -------
+        >>> opt = GamuonAuto(model, lr=1e-3)
+        >>>
+        >>> # Save and later restore
+        >>> torch.save({
+        ...     "model_state": model.state_dict(),
+        ...     "optimizer_state": opt.state_dict(),
+        ... }, "checkpoint.pt")
+        >>>
+        >>> checkpoint = torch.load("checkpoint.pt")
+        >>> opt.load_state_dict(checkpoint["optimizer_state"])
+        """
         if self._conformal and "conformal" in state_dict:
             self._conformal.load_state_dict(state_dict["conformal"])
         if self._gamuon and "gamuon" in state_dict:
