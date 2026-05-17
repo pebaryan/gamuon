@@ -437,6 +437,11 @@ If you *do* want to understand the math:
 
 - **[docs/theory.md](theory.md)** — The full theoretical treatment (heavy math
   warning)
+  - **[§6.6 GamuonAuto](theory.md#66-gamuonauto-a-unified-meta-optimizer)** —
+    The mathematical motivation for the auto-dispatch rule, equivalence proof,
+    and why each parameter type gets its assigned optimizer
+- **[docs/gamuon_auto.md](gamuon_auto.md)** — Dedicated API reference with
+  parameter tables, usage examples, and checkpointing guide
 - **README.md** — Quick overview with some equations
 - The `gamuon.py` source — Well-commented with docstrings
 
