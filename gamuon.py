@@ -993,10 +993,39 @@ class GamuonAuto:
     def step(self, closure: Optional[Callable] = None) -> Optional[float]:
         """Perform a single optimisation step.
 
+        Iterates over all active sub-optimizers (ConformalMuon \u2192 Gamuon
+        \u2192 SGD) and calls their respective ``step()``.  The closure is
+        only passed to the first sub-optimizer; subsequent sub-optimizers
+        receive ``closure=None``.
+
         Parameters
         ----------
         closure : callable, optional
             A closure that reevaluates the model and returns the loss.
+
+        Returns
+        -------
+        float or None
+            The loss from ``closure``, or ``None`` if no closure was given.
+
+        Example
+        -------
+        >>> model = nn.Sequential(nn.Linear(64, 64), nn.LayerNorm(64))
+        >>> opt = GamuonAuto(model, lr=1e-3)
+        >>>
+        >>> # Standard usage (no closure)
+        >>> for x, y in dataloader:
+        ...     opt.zero_grad()
+        ...     loss = model(x).sum()
+        ...     loss.backward()
+        ...     opt.step()
+        >>>
+        >>> # With closure (e.g. LBFGS-style)
+        >>> def closure():
+        ...     loss = model(x).sum()
+        ...     loss.backward()
+        ...     return loss
+        >>> opt.step(closure)
         """
         loss = None
         if closure is not None:
@@ -1008,7 +1037,30 @@ class GamuonAuto:
         return loss
 
     def zero_grad(self, set_to_none: bool = False) -> None:
-        """Clear the gradients of all parameters."""
+        """Clear the gradients of all parameters.
+
+        Delegates to each active sub-optimizer's ``zero_grad()``.
+        The behaviour of ``set_to_none`` matches PyTorch's semantics:
+        ``False`` zeroes the tensors in-place, ``True`` sets the
+        gradient attributes to ``None`` (lower memory footprint).
+
+        Parameters
+        ----------
+        set_to_none : bool, default False
+            If ``True``, sets gradients to ``None`` instead of zeroing.
+            Reduces memory by allowing PyTorch to reclaim gradient
+            storage after each step.
+
+        Example
+        -------
+        >>> opt = GamuonAuto(model, lr=1e-3)
+        >>>
+        >>> # Default: zero in-place
+        >>> opt.zero_grad()
+        >>>
+        >>> # Memory-efficient: set to None
+        >>> opt.zero_grad(set_to_none=True)
+        """
         for opt in self._optimizers:
             opt.zero_grad(set_to_none=set_to_none)
 
