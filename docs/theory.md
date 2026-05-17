@@ -161,42 +161,42 @@ structure of $\mathrm{Cl}(n,0)$ provides:
 **Theorem.** Let $G \in \mathbb{R}^{n \times n}$ be any square matrix. Then $G$
 decomposes uniquely as:
 
-$$G = \underbrace{\frac{\operatorname{tr}(G)}{n} I}_{\text{scalar } \langle G \rangle_0}
+$$G = \underbrace{\frac{\mathrm{tr}(G)}{n} I}_{\text{scalar } \langle G \rangle_0}
     + \underbrace{\frac{G - G^\mathsf{T}}{2}}_{\text{bivector } \langle G \rangle_2}
-    + \underbrace{\frac{G + G^\mathsf{T}}{2} - \frac{\operatorname{tr}(G)}{n} I}_{\text{strain } \langle G \rangle_+}$$
+    + \underbrace{\frac{G + G^\mathsf{T}}{2} - \frac{\mathrm{tr}(G)}{n} I}_{\text{strain } \langle G \rangle_+}$$
 
 **Proof.** Define the three components as above. Then:
 
 $$
 \begin{aligned}
 \langle G \rangle_0 + \langle G \rangle_2 + \langle G \rangle_+
-&= \frac{\operatorname{tr}(G)}{n}I + \frac{G - G^\mathsf{T}}{2}
-   + \frac{G + G^\mathsf{T}}{2} - \frac{\operatorname{tr}(G)}{n}I \\
+&= \frac{\mathrm{tr}(G)}{n}I + \frac{G - G^\mathsf{T}}{2}
+   + \frac{G + G^\mathsf{T}}{2} - \frac{\mathrm{tr}(G)}{n}I \\
 &= \frac{G - G^\mathsf{T} + G + G^\mathsf{T}}{2} = G.
 \end{aligned}
 $$
 
 For uniqueness, note that the three subspaces have trivial intersection: the
 only matrix that is simultaneously isotropic ($\alpha I$), antisymmetric
-($B = -B^\mathsf{T}$), and symmetric traceless ($S = S^\mathsf{T}, \operatorname{tr}(S)=0$)
+($B = -B^\mathsf{T}$), and symmetric traceless ($S = S^\mathsf{T}, \mathrm{tr}(S)=0$)
 is the zero matrix. ∎
 
 ### 2.2 Orthogonality of Grades
 
 The three grades are orthogonal under the Frobenius inner product
-$\langle A, B \rangle = \operatorname{tr}(A^\mathsf{T} B)$:
+$\langle A, B \rangle = \mathrm{tr}(A^\mathsf{T} B)$:
 
 **Proof.**
 
-- **Scalar vs bivector:** $\langle \alpha I, B \rangle = \alpha \operatorname{tr}(B) = 0$
-  since $\operatorname{tr}(B) = 0$ for any antisymmetric matrix.
+- **Scalar vs bivector:** $\langle \alpha I, B \rangle = \alpha \mathrm{tr}(B) = 0$
+  since $\mathrm{tr}(B) = 0$ for any antisymmetric matrix.
 
-- **Scalar vs strain:** $\langle \alpha I, S \rangle = \alpha \operatorname{tr}(S) = 0$
+- **Scalar vs strain:** $\langle \alpha I, S \rangle = \alpha \mathrm{tr}(S) = 0$
   by construction (strain is traceless).
 
-- **Bivector vs strain:** $\langle B, S \rangle = \operatorname{tr}(B^\mathsf{T} S)
-  = \operatorname{tr}(-B S) = -\operatorname{tr}(S B) = -\operatorname{tr}(B S)$.
-  But $\operatorname{tr}(B S) = \operatorname{tr}(S B)$ by cyclic property,
+- **Bivector vs strain:** $\langle B, S \rangle = \mathrm{tr}(B^\mathsf{T} S)
+  = \mathrm{tr}(-B S) = -\mathrm{tr}(S B) = -\mathrm{tr}(B S)$.
+  But $\mathrm{tr}(B S) = \mathrm{tr}(S B)$ by cyclic property,
   so $\langle B, S \rangle = -\langle B, S \rangle = 0$. ∎
 
 This orthogonality is crucial: it means that the gradient's component in each
@@ -434,7 +434,7 @@ $$V[X] = \frac{1}{8}\|X X^\mathsf{T} - I\|_F^2$$
 
 **Proof.** The gradient of $V$ with respect to $X$ is:
 
-$$\nabla_X V = \frac{1}{8} \nabla_X \operatorname{tr}\left((X X^\mathsf{T} - I)^2\right)
+$$\nabla_X V = \frac{1}{8} \nabla_X \mathrm{tr}\left((X X^\mathsf{T} - I)^2\right)
 = \frac{1}{8} \cdot 4 (X X^\mathsf{T} - I) X = \frac{1}{2}(X X^\mathsf{T} X - X)$$
 
 Gradient descent with unit step size directly recovers the Newton–Schulz iteration:

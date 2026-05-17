@@ -66,11 +66,11 @@ where:
 
 | Grade | Expression | Geometric Meaning |
 |---|---|---|
-| **Scalar** $\langle G \rangle_0$ | $\frac{\operatorname{tr}(G)}{n} \cdot I$ | Isotropic dilation (uniform scaling) |
+| **Scalar** $\langle G \rangle_0$ | $\frac{\mathrm{tr}(G)}{n} \cdot I$ | Isotropic dilation (uniform scaling) |
 | **Bivector** $\langle G \rangle_2$ | $\frac{G - G^\mathsf{T}}{2}$ | Infinitesimal rotation (antisymmetric) |
 | **Strain** $\langle G \rangle_+$ | $\frac{G + G^\mathsf{T}}{2} - \langle G \rangle_0$ | Symmetric traceless deformation |
 
-These three grades are **orthogonal** under the Frobenius inner product $\langle A, B \rangle = \operatorname{tr}(A^\mathsf{T} B)$.
+These three grades are **orthogonal** under the Frobenius inner product $\langle A, B \rangle = \mathrm{tr}(A^\mathsf{T} B)$.
 
 ### Bivector Exponential & Rotors
 
