@@ -283,12 +283,33 @@ class Gamuon(torch.optim.Optimizer):
 
     @torch.no_grad()
     def step(self, closure: Optional[Callable] = None) -> Optional[float]:
-        """Perform a single optimization step.
+        """Perform a single optimisation step.
+
+        Decomposes the gradient into scalar, bivector, and strain grades,
+        updates multivector momentum, generates an exact rotor from the
+        bivector via matrix exponential, and applies the versor sandwich
+        update  W \u2192 R\u00b7W\u00b7R\u1d40 \u2212 strain\u2212 scalar dilation.
 
         Parameters
         ----------
         closure : callable, optional
             A closure that reevaluates the model and returns the loss.
+
+        Returns
+        -------
+        float or None
+            The loss from ``closure``, or ``None`` if no closure was given.
+
+        Example
+        -------
+        >>> W = nn.Parameter(torch.randn(32, 32))
+        >>> opt = Gamuon([W], lr=1e-3)
+        >>>
+        >>> for step in range(100):
+        ...     opt.zero_grad()
+        ...     loss = (W ** 2).mean()
+        ...     loss.backward()
+        ...     opt.step()
         """
         loss = None
         if closure is not None:
