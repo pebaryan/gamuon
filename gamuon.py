@@ -1077,6 +1077,37 @@ class GradNormMonitor:
         log_freq: int = 1,
         silent: bool = False,
     ):
+        """Initialise the monitor and detect active sub-optimizer roles.
+
+        Scans ``optimizer``'s three optional sub-optimizer attributes
+        (``_conformal``, ``_gamuon``, ``_sgd``) and builds the internal
+        role mapping and history storage for those that are active.
+
+        Parameters
+        ----------
+        optimizer : GamuonAuto
+            The meta-optimizer to monitor. The monitor reads gradient norms
+            from each sub-optimizer's ``param_groups``; no gradients are
+            modified.
+        log_freq : int, default 1
+            If > 0, prints a ``grad_norm`` line on every call to
+            :meth:`capture`.  Set to ``0`` to suppress live logging
+            (history is still accumulated).
+        silent : bool, default False
+            If ``True``, suppress all console output regardless of
+            ``log_freq``.  Useful for automated benchmarks or when
+            collecting metrics programmatically.
+
+        Notes
+        -----
+        The role detection is a snapshot at construction time.  Adding or
+        removing sub-optimizers after construction is not supported and
+        will not be reflected in captures.
+
+        If all three sub-optimizers are ``None`` (empty model), the
+        monitor will have no roles, and :meth:`capture` will return an
+        empty dict.
+        """
         self._optimizer = optimizer
         self._log_freq = log_freq
         self._silent = silent
@@ -1102,24 +1133,64 @@ class GradNormMonitor:
             }
 
     def capture(self, step: Optional[int] = None) -> dict[str, dict]:
-        """Record gradient norms for all sub-optimizers.
+        """Record gradient norms for all active sub-optimizers.
+
+        Iterates over the parameters of each sub-optimizer, computes the
+        L2 norm of each parameter's gradient (if present), and stores
+        per-role aggregate statistics in the internal history.
 
         Parameters
         ----------
         step : int, optional
-            Current training step (included in logs and history).
+            Current training step or iteration number.  Included in the
+            log line (if ``log_freq > 0``) and stored in history for
+            later use by :meth:`plot` and :meth:`summary`.  Can be any
+            integer; callers often use the global training step or an
+            ``(epoch, batch)``-derived counter.
 
         Returns
         -------
         dict[str, dict]
-            Nested dict keyed by role (\"conformal\", \"gamuon\", \"sgd\")
-            with per-role statistics:
+            Nested dictionary indexed by role (``"conformal"``,
+            ``"gamuon"``, ``"sgd"``).  Each value is a dict with keys:
 
-            - ``total_norm`` \u2014 L2 norm of the concatenated gradient vector
-            - ``mean_norm`` \u2014 average per-parameter gradient norm
-            - ``max_norm`` \u2014 maximum per-parameter gradient norm
-            - ``num_params`` \u2014 number of parameters tracked
-            - ``zero_frac`` \u2014 fraction of parameters with zero / missing gradient
+            - ``total_norm`` *(float)* — L2 norm of the concatenated
+              gradient vector for all parameters in this role,
+              i.e. ``sqrt(\u03a3_i \u2016p_i.grad\u2016_2^2)``.
+            - ``mean_norm`` *(float)* — Average per-parameter L2 norm
+              (``total_norm / num_params`` with non-zero gradients, or
+              ``0.0`` if all gradients are ``None``).
+            - ``max_norm`` *(float)* — Maximum per-parameter L2 norm
+              observed in this role (``0.0`` if all gradients are
+              ``None``).
+            - ``num_params`` *(int)* — Total number of parameters
+              tracked in this role, regardless of whether each
+              parameter has a gradient attached.
+            - ``zero_frac`` *(float)* — Fraction of parameters whose
+              gradient is either ``None`` or exactly zero
+              (0.0 \u2264 ``zero_frac`` \u2264 1.0).
+
+        Raises
+        ------
+        RuntimeError
+            If a parameter's gradient tensor is on a different device
+            than the parameter itself (the ``.norm(2)`` call would
+            fail).  This should not happen in normal training loops.
+
+        Notes
+        -----
+        - Gradients are **not** modified or cleared by this method.
+        - If all parameters in a role have ``None`` gradients
+          (e.g. before the first backward pass), ``total_norm``,
+          ``mean_norm``, and ``max_norm`` are all ``0.0``, while
+          ``zero_frac`` is ``1.0``.
+        - After ``zero_grad(set_to_none=True)``, gradients become
+          ``None``, so the next ``capture()`` sees ``zero_frac = 1.0``.
+          After ``zero_grad(set_to_none=False)``, gradients become
+          zero-valued tensors, so ``zero_frac`` reflects the fraction
+          of parameters with ``p.grad.norm(2) == 0.0`` — typically 1.0
+          as well, since the zeros are counted.
+        - The order of keys in the returned dict is not guaranteed.
         """
         now: dict[str, dict] = {}
 
@@ -1174,20 +1245,43 @@ class GradNormMonitor:
         return now
 
     def summary(self) -> dict[str, dict]:
-        """Return aggregated statistics per sub-optimizer role.
+        """Return aggregated statistics per role across all captured steps.
+
+        Computes summary statistics on the ``total_norm`` time series
+        for each role, plus the mean zero-gradient fraction.  Uses pure
+        Python arithmetic (safe for CPU profiling without GPU sync).
 
         Returns
         -------
         dict[str, dict]
-            Keyed by role, each containing:
+            Nested dictionary indexed by role.  Each value contains:
 
-            - ``count`` \u2014 number of recorded steps
-            - ``mean`` \u2014 mean total norm
-            - ``std`` \u2014 standard deviation of total norm
-            - ``min`` \u2014 minimum total norm
-            - ``max`` \u2014 maximum total norm
-            - ``last`` \u2014 most recent total norm
-            - ``zero_frac_mean`` \u2014 average zero-gradient fraction
+            - ``count`` *(int)* — Number of :meth:`capture` calls
+              recorded.  ``0`` if :meth:`reset` was called or no
+              captures have been made.
+            - ``mean`` *(float)* — Arithmetic mean of ``total_norm``
+              across all captured steps.
+            - ``std`` *(float)* — Population standard deviation of
+              ``total_norm`` (``0.0`` if ``count \u2264 1``).
+            - ``min`` *(float)* — Minimum ``total_norm`` observed.
+            - ``max`` *(float)* — Maximum ``total_norm`` observed.
+            - ``last`` *(float)* — Most recent ``total_norm`` value.
+              Useful for detecting trends relative to the historical
+              ``mean``.
+            - ``zero_frac_mean`` *(float)* — Average ``zero_frac``
+              across all captured steps (0.0 \u2264 value \u2264 1.0).
+              A persistently high value (e.g. ``> 0.5``) may indicate
+              dead units, frozen parameters, or incorrect gradient flow.
+
+        Notes
+        -----
+        - All metrics are computed from ``total_norm`` only.
+          ``mean_norm`` and ``max_norm`` history are stored but not
+          included in the summary output.  Use direct inspection of
+          ``self._history`` if per-role per-parameter detail is needed.
+        - Returns an all-zeros entry for roles with no recorded steps
+          (``count=0``) rather than omitting them, so callers can
+          safely index into the result without key-checking.
         """
         result: dict[str, dict] = {}
         for role, hist in self._history.items():
@@ -1213,16 +1307,45 @@ class GradNormMonitor:
         return result
 
     def plot(self, show: bool = True, save_path: Optional[str] = None) -> None:
-        """Plot gradient norm trajectories per sub-optimizer role.
+        """Visualise gradient norm trajectories per sub-optimizer role.
 
-        Requires ``matplotlib``.  If not installed, prints a warning.
+        Generates a two-panel figure with shared x-axis:
+
+        - **Top panel:** ``total_norm`` vs. step for each active role.
+        - **Bottom panel:** ``mean_norm`` vs. step for each active role.
+
+        Requires ``matplotlib``.  If not installed, prints a warning
+        message and returns silently — the history is still accessible
+        via :meth:`summary` or direct attribute inspection.
 
         Parameters
         ----------
         show : bool, default True
-            Whether to display the plot interactively.
+            Whether to display the plot interactively via
+            ``plt.show()``.  Set to ``False`` when running in
+            non-interactive environments (headless servers, CI, etc.).
         save_path : str, optional
-            If provided, saves the figure to this path.
+            If provided, saves the figure to this file path at 150 DPI.
+            Common values: ``"grad_norms.png"``, ``"plots/step_42.svg"``.
+            The file format is inferred from the extension.
+
+        Notes
+        -----
+        - Steps that were recorded with ``step=None`` are plotted at
+          their index in the capture sequence (0, 1, 2, ...) rather
+          than omitted.
+        - The figure is always closed after display/save to prevent
+          memory leaks in long-running training loops.
+        - If no history has been captured, the plot axes will be empty
+          (each sub-optimizer's line is simply not drawn).
+
+        Examples
+        --------
+        >>> monitor = GradNormMonitor(optimizer, silent=True)
+        >>> for step in range(100):
+        ...     # ... forward / backward ...
+        ...     monitor.capture(step)
+        >>> monitor.plot(show=False, save_path="grad_norm_trajectory.png")
         """
         try:
             import matplotlib.pyplot as plt  # type: ignore[import-untyped]
@@ -1259,7 +1382,29 @@ class GradNormMonitor:
         plt.close(fig)
 
     def reset(self) -> None:
-        """Clear all accumulated history."""
+        """Clear all accumulated history for all roles.
+
+        Removes every recorded entry from the internal history buffers.
+        After calling :meth:`reset`:
+
+        - :meth:`summary` returns ``count=0`` for all roles until new
+          data is recorded by subsequent :meth:`capture` calls.
+        - :meth:`plot` draws empty axes (no lines).
+        - The sub-optimizer references and role mapping are preserved;
+          only the time-series data is discarded.
+
+        This is useful for resetting the monitor at the start of a new
+        validation run or after a learning-rate change without creating
+        a new monitor instance.
+
+        Notes
+        -----
+        - Existing captures in ``self._history`` are cleared in-place
+          using ``list.clear()``, so any references held by the caller
+          to individual history lists are also cleared.
+        - The monitor's ``log_freq`` and ``silent`` settings are
+          unchanged.
+        """
         for role, hist in self._history.items():
             hist["step"].clear()
             hist["total_norm"].clear()
