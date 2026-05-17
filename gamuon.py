@@ -493,6 +493,7 @@ class GamuonNS(torch.optim.Optimizer):
 def find_conformal_pairs(
     model: torch.nn.Module,
     types: Optional[Tuple[type, ...]] = None,
+    detect_weightnorm: bool = True,
 ) -> list:
     """Find  (γ, β)  parameter pairs from normalisation layers.
 
@@ -501,18 +502,27 @@ def find_conformal_pairs(
     one of the specified *types*.  Each tuple is suitable for passing
     directly to :class:`ConformalMuon`.
 
+    Also detects **weight‑normalized** modules (``torch.nn.utils.weight_norm``)
+    by scanning for 1‑D ``weight_g`` parameters, which are paired with
+    ``None`` (no bias counterpart).
+
     Parameters
     ----------
     model : nn.Module
         The model to scan.
     types : tuple of types, optional
         Module types to detect.  Defaults to
-        ``(nn.LayerNorm, nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)``.
+        ``(nn.LayerNorm, nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d,
+        nn.RMSNorm)``.
+    detect_weightnorm : bool, default True
+        Whether to also scan for 1‑D ``weight_g`` parameters created by
+        :func:`torch.nn.utils.weight_norm`.
 
     Returns
     -------
-    list of (Parameter, Parameter)
-        List of  (weight, bias)  pairs found.
+    list of (Parameter, Parameter | None)
+        List of  (weight, bias)  pairs found.  Bias is ``None`` for
+        modules without a bias (RMSNorm, weight_norm, LayerNorm(bias=False)).
     """
     if types is None:
         types = (
@@ -520,6 +530,7 @@ def find_conformal_pairs(
             torch.nn.BatchNorm1d,
             torch.nn.BatchNorm2d,
             torch.nn.BatchNorm3d,
+            torch.nn.RMSNorm,
         )
     pairs = []
     for module in model.modules():
@@ -528,6 +539,18 @@ def find_conformal_pairs(
             b = getattr(module, "bias", None)
             if w is not None:
                 pairs.append((w, b) if b is not None else (w, None))
+        # Detect weight_norm parametrizations
+        if detect_weightnorm:
+            weight_g = getattr(module, "weight_g", None)
+            if weight_g is not None and isinstance(weight_g, torch.nn.Parameter):
+                # weight_g is an "effectively 1D" scale parameter; handles
+                # 1-D (out_features,), column (out_features, 1), and
+                # Conv shapes like (out_channels, 1, 1, 1)
+                is_1d_scale = sum(1 for s in weight_g.shape if s > 1) == 1
+                if is_1d_scale:
+                    # Avoid double-counting if weight_g happens to be on a norm module
+                    if not isinstance(module, types if types is not None else ()):
+                        pairs.append((weight_g, None))
     return pairs
 
 
@@ -592,7 +615,9 @@ class ConformalMuon(torch.optim.Optimizer):
     ----------
     params : iterable or nn.Module
         - If an **nn.Module**, auto‑detects all  (γ, β)  pairs via
-          :func:`find_conformal_pairs`  and treats remaining parameters
+          :func:`find_conformal_pairs`  (covers ``LayerNorm``,
+          ``BatchNorm*\b``, ``RMSNorm``, and weight‑normalized
+          ``weight_g`` parameters) and treats remaining parameters
           with SGD fallback.
         - If an **iterable of dicts** (standard PyTorch param groups),
           groups can optionally include ``"is_conformal": True`` to

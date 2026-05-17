@@ -752,6 +752,63 @@ class TestConformalMuon:
         )
         assert conformal_count == 1  # one LayerNorm
 
+    def test_find_conformal_pairs_rmsnorm(self):
+        """find_conformal_pairs should detect RMSNorm (weight, None) pairs."""
+        model = torch.nn.Sequential(
+            torch.nn.Linear(16, 32),
+            torch.nn.RMSNorm(32),
+        )
+        pairs = find_conformal_pairs(model)
+        assert len(pairs) == 1
+        w, b = pairs[0]
+        assert w is not None
+        assert b is None  # RMSNorm has no bias
+        assert w.shape == (32,)
+
+    def test_find_conformal_pairs_weightnorm(self):
+        """find_conformal_pairs should detect weight_norm weight_g parameters."""
+        model = torch.nn.Sequential(
+            torch.nn.Linear(8, 16),
+            torch.nn.LayerNorm(16),
+        )
+        # Apply weight_norm to the Linear layer
+        torch.nn.utils.weight_norm(model[0], name="weight")
+        pairs = find_conformal_pairs(model)
+
+        # Should find both the LayerNorm pair and the weight_g
+        ln_pairs = [(w, b) for w, b in pairs if b is not None]
+        wn_pairs = [(w, b) for w, b in pairs if b is None]
+
+        assert len(ln_pairs) == 1  # LayerNorm(16)
+        assert len(wn_pairs) == 1  # weight_g from Linear
+        # weight_g is stored as a column vector (out_features, 1)
+        assert wn_pairs[0][0].dim() == 2
+        assert wn_pairs[0][0].shape == (16, 1)  # out_features × 1
+
+    def test_find_conformal_pairs_weightnorm_disabled(self):
+        """find_conformal_pairs should skip weight_g when detect_weightnorm=False."""
+        model = torch.nn.Sequential(torch.nn.Linear(8, 16))
+        torch.nn.utils.weight_norm(model[0], name="weight")
+        pairs = find_conformal_pairs(model, detect_weightnorm=False)
+        assert len(pairs) == 0  # Linear is not a norm type
+
+    def test_find_conformal_pairs_mixed_norms(self):
+        """find_conformal_pairs with RMSNorm + LayerNorm + weight_norm."""
+        model = torch.nn.Sequential(
+            torch.nn.Linear(8, 16),
+            torch.nn.RMSNorm(16),
+            torch.nn.Linear(16, 8),
+            torch.nn.LayerNorm(8),
+        )
+        torch.nn.utils.weight_norm(model[0], name="weight")  # weight_g on first Linear
+        pairs = find_conformal_pairs(model)
+
+        assert len(pairs) == 3  # RMSNorm + LayerNorm + weight_g
+        norm_types = [(w.shape, b is not None) for w, b in pairs]
+        assert (torch.Size([16]), False) in norm_types  # RMSNorm
+        assert (torch.Size([8]), True) in norm_types    # LayerNorm
+        assert (torch.Size([16]), False) in norm_types  # weight_g
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])
