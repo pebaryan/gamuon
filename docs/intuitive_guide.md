@@ -442,7 +442,7 @@ If you *do* want to understand the math:
     and why each parameter type gets its assigned optimizer
 - **[docs/gamuon_auto.md](gamuon_auto.md)** — Dedicated API reference with
   parameter tables, usage examples, and checkpointing guide
-- **README.md** — Quick overview with some equations
+- **[README.md](../README.md#documentation)** — Quick overview with some equations; the [Documentation](../README.md#documentation) section indexes all three doc files by level of depth
 - The `gamuon.py` source — Well-commented with docstrings
 
 ### Performance tip: `foreach`
