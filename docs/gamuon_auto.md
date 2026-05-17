@@ -483,3 +483,6 @@ for name, opt in [
 
 > *For theoretical motivation and the mathematical details behind each dispatch
 > decision, see [§6.6 GamuonAuto: A Unified Meta-Optimizer](theory.md#66-gamuonauto-a-unified-meta-optimizer).*
+>
+> *For monitoring gradient norms across the three sub-optimizers (live logging,
+> summary statistics, plotting), see [`docs/grad_norm.md`](grad_norm.md).*
