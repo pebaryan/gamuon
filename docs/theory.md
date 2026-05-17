@@ -36,6 +36,7 @@ conformal geometry.
    - [6.3 The Conformal Muon Principle](#63-the-conformal-muon-principle)
    - [6.4 The Affine Group Exp Map](#64-the-affine-group-aff1-and-its-exponential-map)
    - [6.5 The ConformalMuon Algorithm](#65-the-conformalmoun-optimizer-algorithm)
+   - [6.6 GamuonAuto: A Unified Meta-Optimizer](#66-gamuonauto-a-unified-meta-optimizer)
 7. [Comparison with Related Optimizers](#7-comparison-with-related-optimizers)
    - [7.1 Muon](#71-muon)
    - [7.2 Adam](#72-adam)
@@ -965,6 +966,137 @@ specification:
 | Parameter coupling | None (independent) | Full (semidirect product) |
 | $\gamma$ sign guaranteed | ❌ (can become negative) | ✅ ($e^a > 0$) |
 | Momentum | Parameter-space EMA | Lie-algebra EMA |
+
+---
+
+## 6.6 GamuonAuto: A Unified Meta-Optimizer
+
+### 6.6.1 Motivation
+
+Sections 1–5 developed the geometric update for square weight matrices(Gamuon: $W \mapsto R W R^\mathsf{T} - \eta \cdot \text{strain} - \eta \cdot \text{scalar}$),
+while Section 6 developed the conformal-group update for normalization
+parameters (ConformalMuon : $(\gamma, \beta) \mapsto (\gamma e^a,\, e^a \beta + b \cdot (e^a-1)/a)$).
+
+In practice, a single model contains *both* types of parameters — and often
+a third category (1‑D biases, embeddings, etc.) that don't benefit from
+either geometric treatment. `GamuonAuto` is a **meta-optimizer** that
+automatically classifies every parameter in an `nn.Module` and dispatches
+it to the appropriate geometric or standard optimizer.
+
+### 6.6.2 The Dispatch Rule
+
+Given an `nn.Module`, `GamuonAuto` partitions its parameters into three
+groups:
+
+| Category | Detected by | Optimizer | Update Form | Theoretical Basis |
+|---|---|---|---|---|
+| **Norm-layer $(\gamma, \beta)$ pairs** | `find_conformal_pairs(model)` — scans submodules for `nn.LayerNorm`, `nn.BatchNorm*`, `nn.RMSNorm`, `nn.GroupNorm`, and weight-normalized `weight_g` parameters | `ConformalMuon` | $(\gamma, \beta) \mapsto (\gamma e^a,\, e^a \beta + b \cdot \frac{e^a-1}{a})$ | §6.4 — Affine group $\mathrm{Aff}(1)$ exponential |
+| **2‑D weight matrices** | Dimensionality check: `p.ndim == 2` and not already assigned to ConformalMuon | `Gamuon` | $W \mapsto R W R^\mathsf{T} - \eta \cdot \text{strain} - \eta \cdot \text{scalar}$ | §2–3 — Grade decomposition in $\mathrm{Cl}(n,0)$ |
+| **1‑D / other parameters** | Everything not caught above (biases, embeddings, conv kernels, etc.) | Plain SGD | $\theta \mapsto \theta - \eta \cdot g_\theta$ | Euclidean gradient descent |
+
+The three sub-optimizers are composed via sequential application in each
+training step:
+
+```
+Algorithm: GamuonAuto.step(closure=None)
+──────────────────────────────────────────
+ 1:  for opt in [ConformalMuon, Gamuon, SGD]:
+ 2:      if opt is not None:
+ 3:          opt.step(closure)
+ 4:          closure = None                        ▷ only first call gets closure
+──────────────────────────────────────────
+```
+
+This design ensures that **each parameter is updated by exactly one sub-optimizer**
+(since the partition is a disjoint cover of the parameter set), and the
+API remains a drop-in replacement for `torch.optim.Optimizer`.
+
+### 6.6.3 Why This Partition Is Theoretically Sound
+
+The dispatch rule is not arbitrary — each decision follows from the
+algebraic structure of the parameter:
+
+1. **Norm-layer $(\gamma, \beta)$ → ConformalMuon.**
+   These parameters form an *affine group* $\mathrm{Aff}(1)$ (see §6.4).
+   Applying a Euclidean optimizer treats them as independent scalars,
+   ignoring the semidirect-product coupling $[G_d, G_t] = G_t$. The
+   conformal exponential correctly handles this coupling and guarantees
+   $\gamma > 0$ by construction.
+
+2. **2‑D weight matrices → Gamuon.**
+   A matrix $W \in \mathbb{R}^{m \times n}$ is a grade-1 element (linear
+   transformation) in the Clifford algebra. When padded to square (or
+   natively square), it admits the grade decomposition into scalar +
+   bivector + strain (§2). The bivector component generates a rotor
+   $R = \exp(\eta B) \in \mathrm{Spin}(n)$, which acts by versor sandwich
+   — preserving the singular-value spectrum (§3.4).
+
+3. **1‑D / other → SGD.**
+   Scalars, vectors, and higher-order tensors do not embed naturally into
+   the grade structure of $\mathrm{Cl}(n,0)$ for square matrices. For
+   these, Euclidean gradient descent is the correct null hypothesis.
+
+### 6.6.4 Relation to the Theory of Combined Optimizers
+
+`GamuonAuto` is a concrete instance of a more general principle: **each
+parameter's optimizer should be chosen to match its algebraic type.**
+
+| Parameter type | Algebraic structure | Natural optimizer |
+|---|---|---|
+| Norm-layer $(\gamma, \beta)$ | Affine group $\mathrm{Aff}(1) \cong \mathbb{R} \rtimes \mathbb{R}^+$ | `ConformalMuon` |
+| Square weight matrix $W \in \mathbb{R}^{n \times n}$ | Clifford algebra $\mathrm{Cl}(n,0)$, grade decomposition | `Gamuon` |
+| General $\theta \in \mathbb{R}^d$ | Euclidean vector space $\mathbb{R}^d$ | SGD / Adam |
+
+This type-driven dispatch is analogous to how a well-designed deep learning
+framework uses different initializations for different layer types: it's
+not about finding a single "best" optimizer, but about matching the
+optimizer's inductive bias to the parameter's geometry.
+
+### 6.6.5 Practical Considerations
+
+**Orthogonality of parameter groups.** Because each parameter belongs to
+exactly one partition, the three sub-optimizers' updates sum without
+interference. This is a form of **geometric orthogonality** — not in the
+inner-product sense, but in the sense that no parameter receives a compound
+update from multiple optimizers.
+
+**Weight decay.** When `weight_decay > 0`, `GamuonAuto` passes it to all
+three sub-optimizers. For `ConformalMuon`, weight decay is applied to the
+Lie-algebra coordinates; for `Gamuon`, it is absorbed into the scalar grade
+(isotropic contraction); for SGD, it is standard L2 regularization. The
+theoretical justification for treating weight decay at the parameter level
+(rather than inside the exponential map) follows from the decoupling of
+grades — weight decay is a scalar operation and does not affect the rotor
+or strain updates.
+
+**Bias correction.** Both `Gamuon` and `ConformalMuon` maintain
+Adam-style bias-corrected exponential moving averages on their respective
+state spaces (grade-valued moments for Gamuon, Lie-algebra moments for
+ConformalMuon). `GamuonAuto` inherits the standard `betas` and `eps`
+hyperparameters from these sub-optimizers.
+
+### 6.6.6 Proof of Correctness: Equivalence with Manual Composition
+
+For a given model, let $\mathcal{P} = \mathcal{P}_c \sqcup \mathcal{P}_g \sqcup \mathcal{P}_s$
+be the disjoint partition induced by `GamuonAuto`, where:
+- $\mathcal{P}_c$ = conformal pairs (norm layers)
+- $\mathcal{P}_g$ = 2‑D weight matrices
+- $\mathcal{P}_s$ = remaining (scalar) parameters
+
+Define the manual combined optimizer $\mathcal{O}_{\text{manual}}$ as:
+
+$$\mathcal{O}_{\text{manual}} = \text{ConformalMuon}(\mathcal{P}_c) \;\circ\; \text{Gamuon}(\mathcal{P}_g) \;\circ\; \text{SGD}(\mathcal{P}_s)$$
+
+Then `GamuonAuto` produces $\mathcal{O}_{\text{auto}}$ such that for any
+gradient computation:
+
+$$\mathcal{O}_{\text{auto}}.\text{step}() \equiv \mathcal{O}_{\text{manual}}.\text{step}()$$
+
+**Proof sketch.** Both optimizers iterate over the same three sub-optimizers
+in the same order, each operating on the same disjoint parameter sets. Since
+sub-optimizer state depends only on their assigned parameters and step count,
+the updates are identical by induction on step number. The equivalence is
+verified empirically by the benchmark suite (`benchmarks/benchmark_transformer.py`). ∎
 
 ---
 
