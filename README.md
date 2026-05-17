@@ -20,7 +20,10 @@
   - [Clifford Algebra Signatures for Architectures](#clifford-algebra-signatures-for-architectures)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
+  - [Using GamuonAuto (recommended)](#using-gamuonauto-recommended)
+  - [Using Gamuon Directly](#using-gamuon-directly)
 - [Usage Examples](#usage-examples)
+  - [GamuonAuto: One-Call Setup](#gamuonauto-one-call-setup)
   - [Basic Usage](#basic-usage)
   - [Per-Grade Learning Rates](#per-grade-learning-rates)
   - [Non-Square Matrices](#non-square-matrices)
@@ -31,6 +34,7 @@
   - [`bivector_exp`](#bivector_exp)
   - [`rotor_apply`](#rotor_apply)
   - [`MultivectorMomentum`](#multivectormomentum)
+  - [`GamuonAuto`](#gamuonauto)
   - [`Gamuon`](#gamuon)
   - [`newton_schulz`](#newton_schulz)
   - [`GamuonNS`](#gamuonns)
@@ -189,6 +193,43 @@ pip install -e .[torch,dev]  # includes test dependencies
 
 ## Quick Start
 
+### Using GamuonAuto (recommended)
+
+For most models, the simplest entry point is `GamuonAuto` — pass it your model
+and it automatically detects the right optimizer for each parameter:
+
+```python
+import torch
+from gamuon import GamuonAuto
+
+model = torch.nn.Sequential(
+    torch.nn.Linear(64, 64),
+    torch.nn.LayerNorm(64),
+)
+
+# One-call setup — auto-detects norm layers, 2D matrices, and other params
+optimizer = GamuonAuto(model, lr=1e-3)
+
+for x, y in dataloader:
+    optimizer.zero_grad()
+    loss = ((model(x) - y) ** 2).mean()
+    loss.backward()
+    optimizer.step()
+```
+
+Under the hood, `GamuonAuto` dispatches each parameter to the best optimizer
+based on its algebraic type:
+
+| Parameter type | Optimizer | Update form |
+|---|---|---|
+| Norm-layer (\u03b3, \u03b2) pairs | `ConformalMuon` | Affine-group exponential (respects semidirect product structure) |
+| 2-D weight matrices | `Gamuon` | Grade decomposition + rotor sandwich |
+| 1-D / other parameters | Plain SGD | Standard gradient descent |
+
+### Using Gamuon Directly
+
+If you prefer to manage parameter groups yourself, use `Gamuon` directly:
+
 ```python
 import torch
 from gamuon import Gamuon
@@ -204,9 +245,44 @@ for x, y in dataloader:
     optimizer.step()
 ```
 
+> **Note:** `Gamuon` only operates on 2-D weight matrices. Norm-layer (\u03b3, \u03b2)
+> parameters are silently skipped since they are 1-D. Use `GamuonAuto` if your
+> model has normalization layers (most do).
+
 ---
 
 ## Usage Examples
+
+### GamuonAuto: One-Call Setup
+
+`GamuonAuto` is the recommended entry point for most users. Pass any
+`nn.Module` and it handles parameter discovery and dispatch automatically:
+
+```python
+import torch
+from gamuon import GamuonAuto
+
+model = torch.nn.Sequential(
+    torch.nn.Linear(512, 512),
+    torch.nn.LayerNorm(512),
+    torch.nn.Linear(512, 256),
+)
+
+# Auto-detect norm layers → ConformalMuon, 2D matrices → Gamuon, rest → SGD
+optimizer = GamuonAuto(model, lr=1e-3)
+
+# Standard training loop — nothing else changes
+for x, y in dataloader:
+    optimizer.zero_grad()
+    loss = (model(x) - y).pow(2).mean()
+    loss.backward()
+    optimizer.step()
+```
+
+`GamuonAuto` wraps three sub-optimizers with the same `Optimizer` API:
+`step()`, `zero_grad()`, `state_dict()`, `load_state_dict()`.
+
+---
 
 ### Basic Usage
 
@@ -371,6 +447,36 @@ Returns `(m_s, m_b, m_p, v_s, v_b, v_p)` — the six momentum buffers after the 
 
 ---
 
+### `GamuonAuto`
+
+```python
+class GamuonAuto(model, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0)
+```
+
+Meta-optimizer that automatically partitions an `nn.Module`'s parameters and
+dispatches each to the appropriate optimizer based on algebraic type.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `model` | — | An `nn.Module` whose parameters are auto-discovered and partitioned |
+| `lr` | `1e-3` | Base learning rate (passed to all sub-optimizers) |
+| `betas` | `(0.9, 0.999)` | Adam-style momentum decay rates |
+| `eps` | `1e-8` | Numerical stability term |
+| `weight_decay` | `0.0` | L2 weight decay (applied to all sub-optimizers) |
+
+**Dispatch logic:**
+
+| Parameter category | Detection | Sub-optimizer |
+|---|---|---|
+| Norm-layer (\u03b3, \u03b2) pairs | `find_conformal_pairs(model)` | `ConformalMuon` — affine-group exponential |
+| 2-D weight matrices | `p.ndim == 2` and not conformal | `Gamuon` — grade decomposition + rotor |
+| 1-D / other parameters | Everything else | Plain SGD |
+
+Public API matches `torch.optim.Optimizer`: `step()`, `zero_grad()`,
+`state_dict()`, `load_state_dict()`.
+
+---
+
 ### `Gamuon`
 
 ```python
@@ -456,6 +562,7 @@ The test suite covers:
 | Newton-Schulz | 2 tests | Orthogonality, SPD convergence |
 | Gamuon optimizer | 7 tests | Linear regression, square matrix, non-square padding, per-grade LR, weight decay, momentum persistence, closure |
 | GamuonNS | 1 test | Runtime |
+| GamuonAuto | 11 tests | Parameter partitioning, norm/rms/groupnorm detection, empty model, training step, state dict, convergence, output shape, weight-norm detection |
 | Edge cases | 5 tests | 2×2, 3×3, 16×16, zero gradient, multiple params |
 
 ---
