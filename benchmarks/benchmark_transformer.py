@@ -27,7 +27,8 @@ import torch.nn.functional as F
 # ── Gamuon ──────────────────────────────────────────────────────────────
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from gamuon import (Gamuon, GamuonNS, grade_decompose, newton_schulz,
+from gamuon import (Gamuon, GamuonNS, GamuonAuto, grade_decompose,
+                       newton_schulz,
                        ConformalMuon, find_conformal_pairs)
 
 

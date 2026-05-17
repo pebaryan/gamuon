@@ -40,6 +40,7 @@ from typing import Callable, Iterable, Optional, Tuple
 import torch
 
 
+
 # ╔══════════════════════════════════════════════════════════════════════╗
 # ║  CLIFFORD ALGEBRA PRIMITIVES  (Cl(n, 0)  –  Euclidean signature)   ║
 # ╚══════════════════════════════════════════════════════════════════════╝
@@ -513,7 +514,7 @@ def find_conformal_pairs(
     types : tuple of types, optional
         Module types to detect.  Defaults to
         ``(nn.LayerNorm, nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d,
-        nn.RMSNorm)``.
+        nn.GroupNorm, nn.RMSNorm)``.
     detect_weightnorm : bool, default True
         Whether to also scan for 1‑D ``weight_g`` parameters created by
         :func:`torch.nn.utils.weight_norm`.
@@ -530,6 +531,7 @@ def find_conformal_pairs(
             torch.nn.BatchNorm1d,
             torch.nn.BatchNorm2d,
             torch.nn.BatchNorm3d,
+            torch.nn.GroupNorm,
             torch.nn.RMSNorm,
         )
     pairs = []
@@ -616,8 +618,8 @@ class ConformalMuon(torch.optim.Optimizer):
     params : iterable or nn.Module
         - If an **nn.Module**, auto‑detects all  (γ, β)  pairs via
           :func:`find_conformal_pairs`  (covers ``LayerNorm``,
-          ``BatchNorm*\b``, ``RMSNorm``, and weight‑normalized
-          ``weight_g`` parameters) and treats remaining parameters
+          ``BatchNorm*\b``, ``GroupNorm``, ``RMSNorm``, and
+          weight‑normalized ``weight_g`` parameters) and treats remaining parameters
           with SGD fallback.
         - If an **iterable of dicts** (standard PyTorch param groups),
           groups can optionally include ``"is_conformal": True`` to
@@ -815,3 +817,217 @@ class ConformalMuon(torch.optim.Optimizer):
             _, trans = _affine_exp(a, b, eps)
             beta.data.mul_(delta_gamma)  # e^a · β
             beta.data.add_(trans)  # + b · (e^a - 1) / a
+
+
+# ╔════════════════════════════════════════════════════════════════════════════════╗
+# ║  AUTO META-OPTIMIZER                                         ║
+# ║  Gamuon + ConformalMuon + SGD in one shot                     ║
+# ╚════════════════════════════════════════════════════════════════════════════════╝
+
+
+class GamuonAuto:
+    """One-stop meta-optimizer: auto-detects norm pairs, 2D weights, and the rest.
+
+    ``GamuonAuto`` is the simplest way to use Gamuon in practice.  Pass it any
+    ``nn.Module`` and it automatically partitions parameters:
+
+    * **Norm-layer**  (\u03b3, \u03b2)  pairs  (LayerNorm, BatchNorm, RMSNorm,
+      GroupNorm, weight_norm)  \u2192  :class:`ConformalMuon`  (affine-group update)
+    * **2\u2011D matrix** weights  \u2192  :class:`Gamuon`  (grade decomposition + rotor)
+    * **1\u2011D / other** params  \u2192  plain SGD
+
+    All three sub-optimisers share the same learning rate and momentum
+    hyper-parameters, so you can use this class exactly as you would
+    ``torch.optim.Adam``.
+
+    Parameters
+    ----------
+    params : nn.Module or iterable
+        - If an **nn.Module**, all parameters are auto-discovered and
+          partitioned as described above.
+        - If an **iterable** (standard param groups), each group must
+          include an ``"role"`` key with one of:
+          ``"conformal"``, ``"gamuon"``, ``"sgd"``.
+    lr : float, default 1e-3
+        Learning rate.
+    betas : (float, float), default (0.9, 0.999)
+        Coefficients for first- and second-moment estimates.
+    eps : float, default 1e-8
+        Numerical stability term.
+    weight_decay : float, default 0.0
+        Weight decay applied to all parameters.
+    foreach : bool, default True
+        Whether Gamuon should use fused foreach operations.
+
+    Example
+    -------
+    >>> model = nn.Sequential(nn.Linear(64, 64), nn.LayerNorm(64))
+    >>> opt = GamuonAuto(model, lr=1e-3)
+    >>>
+    >>> for step in range(1000):
+    ...     loss = model(x).sum()
+    ...     opt.zero_grad()
+    ...     loss.backward()
+    ...     opt.step()
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float = 1e-3,
+        betas: Tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.0,
+        foreach: bool = True,
+    ):
+        self.lr = lr
+        self.betas = betas
+        self.eps = eps
+        self.weight_decay = weight_decay
+        self.foreach = foreach
+
+        self._conformal: Optional[ConformalMuon] = None
+        self._gamuon: Optional[Gamuon] = None
+        self._sgd: Optional[torch.optim.SGD] = None
+
+        if isinstance(params, torch.nn.Module):
+            self._init_from_module(params)
+        else:
+            self._init_from_groups(params)
+
+        # Collect sub-optimisers that actually have work to do
+        self._optimizers: list[torch.optim.Optimizer] = [
+            o for o in (self._conformal, self._gamuon, self._sgd)
+            if o is not None and any(
+                len(g["params"]) > 0 for g in o.param_groups
+            )
+        ]
+
+    # ── Module-based initialisation ─────────────────────────────────
+
+    def _init_from_module(self, model: torch.nn.Module) -> None:
+        pairs = find_conformal_pairs(model)
+        conf_ids: set[int] = set()
+        for w, b in pairs:
+            conf_ids.add(id(w))
+            if b is not None:
+                conf_ids.add(id(b))
+
+        gamuon_params: list[torch.Tensor] = []
+        sgd_params: list[torch.Tensor] = []
+
+        for p in model.parameters():
+            if id(p) in conf_ids:
+                continue
+            if p.ndim == 2:
+                gamuon_params.append(p)
+            else:
+                sgd_params.append(p)
+
+        if pairs:
+            self._conformal = ConformalMuon(
+                pairs,
+                lr=self.lr,
+                betas=self.betas,
+                eps=self.eps,
+                weight_decay=self.weight_decay,
+            )
+        if gamuon_params:
+            self._gamuon = Gamuon(
+                [{"params": gamuon_params}],
+                lr=self.lr,
+                betas=self.betas,
+                eps=self.eps,
+                weight_decay=self.weight_decay,
+                foreach=self.foreach,
+            )
+        if sgd_params:
+            self._sgd = torch.optim.SGD(
+                [{"params": sgd_params}],
+                lr=self.lr,
+                weight_decay=self.weight_decay,
+            )
+
+    # ── Manual group-based initialisation ───────────────────────────
+
+    def _init_from_groups(self, param_groups: Iterable[dict]) -> None:
+        conf_params: list[dict] = []
+        gamuon_params: list[dict] = []
+        sgd_params: list[dict] = []
+
+        for group in param_groups:
+            role = group.get("role", "sgd")
+            if role == "conformal":
+                conf_params.append(group)
+            elif role == "gamuon":
+                gamuon_params.append(group)
+            else:
+                sgd_params.append(group)
+
+        if conf_params:
+            self._conformal = ConformalMuon(
+                conf_params,
+                lr=self.lr,
+                betas=self.betas,
+                eps=self.eps,
+                weight_decay=self.weight_decay,
+            )
+        if gamuon_params:
+            self._gamuon = Gamuon(
+                gamuon_params,
+                lr=self.lr,
+                betas=self.betas,
+                eps=self.eps,
+                weight_decay=self.weight_decay,
+                foreach=self.foreach,
+            )
+        if sgd_params:
+            self._sgd = torch.optim.SGD(
+                sgd_params,
+                lr=self.lr,
+                weight_decay=self.weight_decay,
+            )
+
+    # ── Public API ──────────────────────────────────────────────────
+
+    def step(self, closure: Optional[Callable] = None) -> Optional[float]:
+        """Perform a single optimisation step.
+
+        Parameters
+        ----------
+        closure : callable, optional
+            A closure that reevaluates the model and returns the loss.
+        """
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for opt in self._optimizers:
+            opt.step(closure=None)
+        return loss
+
+    def zero_grad(self, set_to_none: bool = False) -> None:
+        """Clear the gradients of all parameters."""
+        for opt in self._optimizers:
+            opt.zero_grad(set_to_none=set_to_none)
+
+    def state_dict(self) -> dict:
+        """Return the state of all sub-optimisers as a nested dict.
+
+        Compatible with ``torch.save`` / ``torch.load`` for checkpointing.
+        """
+        return {
+            "conformal": self._conformal.state_dict() if self._conformal else {},
+            "gamuon": self._gamuon.state_dict() if self._gamuon else {},
+            "sgd": self._sgd.state_dict() if self._sgd else {},
+        }
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        """Load a previously saved state dict."""
+        if self._conformal and "conformal" in state_dict:
+            self._conformal.load_state_dict(state_dict["conformal"])
+        if self._gamuon and "gamuon" in state_dict:
+            self._gamuon.load_state_dict(state_dict["gamuon"])
+        if self._sgd and "sgd" in state_dict:
+            self._sgd.load_state_dict(state_dict["sgd"])
