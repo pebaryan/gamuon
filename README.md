@@ -201,6 +201,7 @@ The following documents provide in-depth coverage of different aspects of Gamuon
 | [`docs/intuitive_guide.md`](docs/intuitive_guide.md) | A gentle, example-driven introduction to geometric algebra concepts and how Gamuon applies them to optimization. Start here if you are new to Clifford algebras. |
 | [`docs/theory.md`](docs/theory.md) | Full mathematical treatment covering Clifford algebra foundations, grade decomposition, bivector exponentials, Newton–Schulz flow, conformal GA for normalisation layers, and the GamuonAuto dispatch theorem (\u00a76.6). |
 | [`docs/gamuon_auto.md`](docs/gamuon_auto.md) | Dedicated API reference for the ``GamuonAuto`` meta-optimizer: constructor parameters, dispatch logic, usage examples, checkpointing, LR scheduling, AMP, and common Q&A. |
+| [`docs/grad_norm.md`](docs/grad_norm.md) | API reference for the ``GradNormMonitor`` utility: per-role gradient norm tracking across sub-optimizers with live logging, summary statistics, and matplotlib visualisation. |
 
 ---
 
