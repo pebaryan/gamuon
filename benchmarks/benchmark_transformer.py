@@ -36,6 +36,25 @@ from gamuon import (Gamuon, GamuonNS, grade_decompose, newton_schulz,
 # ╚══════════════════════════════════════════════════════════════════════╝
 
 
+class GroupNormWrapper(nn.GroupNorm):
+    """Wrapper that permutes (B, T, D) → (B, D, T) for GroupNorm, then back.
+
+    nn.GroupNorm expects channels-first input (N, C, *spatial), but
+    the transformer uses (batch, seq_len, d_model). This wrapper
+    inherits from nn.GroupNorm so isinstance checks (used by
+    _norm_layers, find_conformal_pairs, etc.) work naturally.
+    """
+
+    def __init__(self, num_groups: int, num_channels: int):
+        super().__init__(num_groups, num_channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, D) → (B, D, T) for GroupNorm → (B, T, D)
+        x = x.permute(0, 2, 1)
+        x = super().forward(x)
+        return x.permute(0, 2, 1)
+
+
 class SinusoidalEmbedding(nn.Module):
     """Sinusoidal positional encoding."""
 
@@ -83,9 +102,13 @@ class CausalSelfAttention(nn.Module):
 class TransformerBlock(nn.Module):
     """Pre-norm transformer block."""
 
-    def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1, norm_type: str = "layernorm"):
+    def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1,
+                 norm_type: str = "layernorm", groupnorm_groups: int = 8):
         super().__init__()
-        if norm_type == "rmsnorm":
+        if norm_type == "groupnorm":
+            self.ln1 = GroupNormWrapper(groupnorm_groups, d_model)
+            self.ln2 = GroupNormWrapper(groupnorm_groups, d_model)
+        elif norm_type == "rmsnorm":
             self.ln1 = nn.RMSNorm(d_model)
             self.ln2 = nn.RMSNorm(d_model)
         else:
@@ -118,6 +141,7 @@ class SmallTransformer(nn.Module):
         max_len: int = 64,
         dropout: float = 0.1,
         norm_type: str = "layernorm",
+        groupnorm_groups: int = 8,
     ):
         super().__init__()
         self.norm_type = norm_type
@@ -125,9 +149,12 @@ class SmallTransformer(nn.Module):
         self.pos_enc = SinusoidalEmbedding(d_model, max_len)
         self.dropout = nn.Dropout(dropout)
         self.blocks = nn.ModuleList([
-            TransformerBlock(d_model, d_ff, dropout, norm_type) for _ in range(n_layers)
+            TransformerBlock(d_model, d_ff, dropout, norm_type, groupnorm_groups)
+            for _ in range(n_layers)
         ])
-        if norm_type == "rmsnorm":
+        if norm_type == "groupnorm":
+            self.ln_f = GroupNormWrapper(groupnorm_groups, d_model)
+        elif norm_type == "rmsnorm":
             self.ln_f = nn.RMSNorm(d_model)
         else:
             self.ln_f = nn.LayerNorm(d_model)
@@ -284,10 +311,10 @@ def get_param_groups(model: nn.Module, lr: float) -> list[dict]:
 
 
 def _norm_layers(model: nn.Module) -> list[tuple[str, nn.Module]]:
-    """Return (name, module) pairs for all norm layers (LayerNorm or RMSNorm)."""
+    """Return (name, module) pairs for all norm layers (LayerNorm, RMSNorm, or GroupNorm)."""
     out = []
     for name, mod in model.named_modules():
-        if isinstance(mod, (nn.LayerNorm, nn.RMSNorm)):
+        if isinstance(mod, (nn.LayerNorm, nn.RMSNorm, nn.GroupNorm)):
             out.append((name, mod))
     return out
 
@@ -296,12 +323,13 @@ def extract_norm_params(model: nn.Module) -> dict[str, tuple[float, float]]:
     """Extract norm layer (γ, β) mean values from a model.
 
     For RMSNorm, beta is reported as 0.0 (no bias parameter).
+    GroupNorm has both gamma and beta (like LayerNorm).
     Returns a dict mapping layer name → (gamma_mean, beta_mean).
     """
     params = {}
     for name, mod in _norm_layers(model):
         gamma = mod.weight.data.mean().item() if mod.weight is not None else 0.0
-        if isinstance(mod, nn.LayerNorm) and mod.bias is not None:
+        if isinstance(mod, (nn.LayerNorm, nn.GroupNorm)) and mod.bias is not None:
             beta = mod.bias.data.mean().item()
         else:
             beta = 0.0
@@ -313,16 +341,23 @@ def extract_norm_tensors(model: nn.Module) -> dict[str, dict]:
     """Extract full (γ, β) tensors from norm layers, plus their means.
 
     For RMSNorm, beta is None and beta_mean is 0.0.
+    GroupNorm has both gamma and beta (like LayerNorm).
     Returns a dict mapping layer name → {"gamma": tensor, "beta": tensor | None,
     "gamma_mean": float, "beta_mean": float, "norm_type": str}.
     """
     data = {}
     for name, mod in _norm_layers(model):
         g = mod.weight.data.detach().clone() if mod.weight is not None else None
-        if isinstance(mod, nn.LayerNorm) and hasattr(mod, "bias") and mod.bias is not None:
+        if isinstance(mod, (nn.LayerNorm, nn.GroupNorm)) and hasattr(mod, "bias") and mod.bias is not None:
             b = mod.bias.data.detach().clone()
         else:
             b = None
+        if isinstance(mod, nn.RMSNorm):
+            norm_type = "RMSNorm"
+        elif isinstance(mod, nn.GroupNorm):
+            norm_type = "GroupNorm"
+        else:
+            norm_type = "LayerNorm"
         data[name] = {
             "gamma": g,
             "beta": b,
@@ -330,7 +365,7 @@ def extract_norm_tensors(model: nn.Module) -> dict[str, dict]:
             "beta_mean": b.mean().item() if b is not None else 0.0,
             "gamma_norm": g.norm().item() if g is not None else 0.0,
             "beta_norm": b.norm().item() if b is not None else 0.0,
-            "norm_type": "RMSNorm" if isinstance(mod, nn.RMSNorm) else "LayerNorm",
+            "norm_type": norm_type,
         }
     return data
 
@@ -441,7 +476,7 @@ def print_norm_comparison(results: list[dict]):
     # Detect norm type from first layer
     first_key = list(init_layers.keys())[0]
     norm_type = init_layers[first_key].get("norm_type", "LayerNorm")
-    has_beta = norm_type == "LayerNorm" and init_layers[first_key].get("beta") is not None
+    has_beta = norm_type in ("LayerNorm", "GroupNorm") and init_layers[first_key].get("beta") is not None
 
     if has_beta:
         header_lbl = f"{norm_type} \u03b3/\u03b2"
@@ -496,7 +531,8 @@ def print_norm_comparison(results: list[dict]):
 def plot_norm_trajectories(results: list[dict], save_path: Optional[Path] = None):
     """Generate a separate figure showing norm-layer \u03b3/\u03b2 trajectories.
 
-    Supports both LayerNorm (\u03b3 + \u03b2) and RMSNorm (\u03b3 only).
+    Supports LayerNorm (\u03b3 + \u03b2), RMSNorm (\u03b3 only), and
+    GroupNorm (\u03b3 + \u03b2 like LayerNorm).
     """
     try:
         import matplotlib
@@ -518,7 +554,7 @@ def plot_norm_trajectories(results: list[dict], save_path: Optional[Path] = None
     # Detect norm type from first layer
     first_layer = traj_gamuon[0]["layers"][layer_names[0]]
     norm_type = first_layer.get("norm_type", "LayerNorm")
-    has_beta = norm_type == "LayerNorm" and first_layer.get("beta") is not None
+    has_beta = norm_type in ("LayerNorm", "GroupNorm") and first_layer.get("beta") is not None
 
     n_layers = len(layer_names)
     n_cols = 2 if has_beta else 1
@@ -574,7 +610,12 @@ def plot_norm_trajectories(results: list[dict], save_path: Optional[Path] = None
     plt.tight_layout()
 
     if save_path:
-        suffix = "_rmsnorm" if norm_type == "RMSNorm" else ""
+        if norm_type == "GroupNorm":
+            suffix = "_groupnorm"
+        elif norm_type == "RMSNorm":
+            suffix = "_rmsnorm"
+        else:
+            suffix = ""
         norms_plot_path = save_path.with_name(f"benchmark_norm_trajectories{suffix}.pdf")
         fig.savefig(norms_plot_path, dpi=150, bbox_inches="tight")
         print(f"[benchmark] Norm trajectory plot saved to {norms_plot_path}")
@@ -724,6 +765,10 @@ def main():
                         help="Force CPU even if CUDA is available")
     parser.add_argument("--rmsnorm", action="store_true",
                         help="Use RMSNorm instead of LayerNorm for all norm layers")
+    parser.add_argument("--groupnorm", action="store_true",
+                        help="Use GroupNorm instead of LayerNorm for all norm layers")
+    parser.add_argument("--groupnorm-groups", type=int, default=8,
+                        help="Number of groups for GroupNorm (default: 8)")
     args = parser.parse_args()
 
     device = torch.device(
@@ -735,7 +780,13 @@ def main():
     print(f"[benchmark] Data: vocab={args.vocab_size}, "
           f"batch={args.batch_size}, seq_len={args.seq_len}")
     print(f"[benchmark] Steps: {args.steps}, LR: {args.lr}, Seed: {args.seed}")
-    print(f"[benchmark] Norm type: {'RMSNorm' if args.rmsnorm else 'LayerNorm'}")
+    if args.groupnorm:
+        norm_type_str = f"GroupNorm({args.groupnorm_groups}, {args.d_model})"
+    elif args.rmsnorm:
+        norm_type_str = "RMSNorm"
+    else:
+        norm_type_str = "LayerNorm"
+    print(f"[benchmark] Norm type: {norm_type_str}")
     print()
 
     torch.manual_seed(args.seed)
@@ -743,13 +794,20 @@ def main():
     # ── Build model (shared across all optimizers) ─────────────────
     # We create a fresh copy for each optimizer to ensure fair comparison
     def make_model():
+        if args.groupnorm:
+            norm_type = "groupnorm"
+        elif args.rmsnorm:
+            norm_type = "rmsnorm"
+        else:
+            norm_type = "layernorm"
         return SmallTransformer(
             vocab_size=args.vocab_size,
             d_model=args.d_model,
             d_ff=args.d_ff,
             n_layers=args.n_layers,
             max_len=args.seq_len + 1,
-            norm_type="rmsnorm" if args.rmsnorm else "layernorm",
+            norm_type=norm_type,
+            groupnorm_groups=args.groupnorm_groups,
         ).to(device)
 
     # ── Define optimizers ──────────────────────────────────────────
