@@ -483,3 +483,310 @@ class GamuonNS(torch.optim.Optimizer):
                 p.data.add_(-update)
 
         return loss
+
+
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  CONFORMAL MUON  (CGA Cl(4,1)  for normalisation layers)           ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+
+def find_conformal_pairs(
+    model: torch.nn.Module,
+    types: Optional[Tuple[type, ...]] = None,
+) -> list:
+    """Find  (γ, β)  parameter pairs from normalisation layers.
+
+    Scans all submodules of *model* and returns a list of
+    ``(weight_param, bias_param)`` tuples for every module matching
+    one of the specified *types*.  Each tuple is suitable for passing
+    directly to :class:`ConformalMuon`.
+
+    Parameters
+    ----------
+    model : nn.Module
+        The model to scan.
+    types : tuple of types, optional
+        Module types to detect.  Defaults to
+        ``(nn.LayerNorm, nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)``.
+
+    Returns
+    -------
+    list of (Parameter, Parameter)
+        List of  (weight, bias)  pairs found.
+    """
+    if types is None:
+        types = (
+            torch.nn.LayerNorm,
+            torch.nn.BatchNorm1d,
+            torch.nn.BatchNorm2d,
+            torch.nn.BatchNorm3d,
+        )
+    pairs = []
+    for module in model.modules():
+        if isinstance(module, types):
+            w = getattr(module, "weight", None)
+            b = getattr(module, "bias", None)
+            if w is not None:
+                pairs.append((w, b) if b is not None else (w, None))
+    return pairs
+
+
+def _affine_exp(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-8) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply the exponential map of the 1D affine group to a  (γ, β)  pair.
+
+    The affine group  Aff(1)  has Lie algebra spanned by:
+        G_d = [[1, 0], [0, 0]]   (dilation generator)
+        G_t = [[0, 1], [0, 0]]   (translation generator)
+
+    For  (a, b)  in the Lie algebra, the exponential map gives:
+        exp(a·G_d + b·G_t) = [[e^a,  b·(e^a - 1)/a], [0, 1]]
+
+    Applied to  (γ, β):
+        γ' = γ · e^a
+        β' = e^a · β + b · (e^a - 1) / a
+
+    Parameters
+    ----------
+    a : tensor
+        Dilation coefficient  (same shape as gamma).
+    b : tensor
+        Translation coefficient  (same shape as beta).
+    eps : float
+        Threshold below which  a  is treated as zero
+        (pure translation limit).
+
+    Returns
+    -------
+    delta_gamma : tensor
+        Multiplicative factor for gamma  (exp_a).
+    delta_beta : tensor
+        Additive update for beta.
+    """
+    exp_a = torch.exp(a)
+    # Where |a| is tiny, use the limit:  (e^a - 1)/a → 1
+    mask = a.abs() > eps
+    translation_factor = torch.where(
+        mask,
+        (exp_a - 1) / a,
+        torch.ones_like(a),
+    )
+    delta_gamma = exp_a
+    delta_beta = b * translation_factor
+    return delta_gamma, delta_beta
+
+
+class ConformalMuon(torch.optim.Optimizer):
+    """Conformal Muon — geometric optimisation for normalisation layers.
+
+    Treats  (γ, β)  parameter pairs of LayerNorm / BatchNorm as elements
+    of the affine group  Aff(1)  (dilation + translation), which is the
+    1‑D restriction of the conformal group  Spin(4,1)  in CGA Cl(4,1).
+
+    Instead of updating  γ  and  β  independently (as Adam does), the
+    update respects the semidirect-product structure
+       ℝ  ⋊  ℝ⁺
+    of the conformal group: dilations are multiplicative, translations
+    are additive, and they do **not** commute.
+
+    Parameters
+    ----------
+    params : iterable or nn.Module
+        - If an **nn.Module**, auto‑detects all  (γ, β)  pairs via
+          :func:`find_conformal_pairs`  and treats remaining parameters
+          with SGD fallback.
+        - If an **iterable of dicts** (standard PyTorch param groups),
+          groups can optionally include ``"is_conformal": True`` to
+          apply the affine update.  Groups without this flag get plain SGD.
+    lr : float, default 1e-3
+        Learning rate.
+    betas : (float, float), default (0.9, 0.999)
+        Coefficients for first‑ and second‑moment estimates on the
+        Lie algebra  (dilation and translation channels).
+    eps : float, default 1e-8
+        Numerical stability term.
+    weight_decay : float, default 0.0
+        Weight decay applied to all parameters.
+
+    Example
+    -------
+    >>> model = nn.Sequential(nn.Linear(64, 64), nn.LayerNorm(64))
+    >>> opt = ConformalMuon(model, lr=1e-3)
+    >>> # Or with explicit pairs:
+    >>> pairs = find_conformal_pairs(model)
+    >>> opt = ConformalMuon(pairs, lr=1e-3)
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float = 1e-3,
+        betas: Tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.0,
+    ):
+        if not 0.0 <= lr:
+            raise ValueError(f"Invalid lr: {lr}")
+        if not 0.0 <= eps:
+            raise ValueError(f"Invalid eps: {eps}")
+        if not 0.0 <= betas[0] < 1.0:
+            raise ValueError(f"Invalid beta_0: {betas[0]}")
+        if not 0.0 <= betas[1] < 1.0:
+            raise ValueError(f"Invalid beta_1: {betas[1]}")
+        if not 0.0 <= weight_decay:
+            raise ValueError(f"Invalid weight_decay: {weight_decay}")
+
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+
+        # ── Handle Module auto‑detection ────────────────────────────
+        if isinstance(params, torch.nn.Module):
+            model = params
+            pairs = find_conformal_pairs(model)
+            other = []
+            pair_params = set()
+            for w, b in pairs:
+                pair_params.add(id(w))
+                if b is not None:
+                    pair_params.add(id(b))
+            for p in model.parameters():
+                if id(p) not in pair_params:
+                    other.append(p)
+
+            param_groups = []
+            for w, b in pairs:
+                group_params = [w]
+                if b is not None:
+                    group_params.append(b)
+                param_groups.append({"params": group_params, "is_conformal": True})
+            if other:
+                param_groups.append({"params": other, "is_conformal": False})
+            super().__init__(param_groups, defaults)
+
+        elif isinstance(params, list) and all(
+            isinstance(g, tuple) and len(g) == 2 for g in params
+        ):
+            # List of (weight, bias) tuples
+            param_groups = []
+            for w, b in params:
+                group_params = [w]
+                if b is not None:
+                    group_params.append(b)
+                param_groups.append({"params": group_params, "is_conformal": True})
+            super().__init__(param_groups, defaults)
+
+        else:
+            # Standard param groups (user must add "is_conformal" key)
+            super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure: Optional[Callable] = None) -> Optional[float]:
+        """Perform a single optimisation step.
+
+        For conformal parameter groups (pairs of 1‑D tensors), the
+        update is the affine‑group exponential map.  Other groups
+        receive plain SGD.
+        """
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group["lr"]
+            beta1, beta2 = group["betas"]
+            eps = group["eps"]
+            wd = group["weight_decay"]
+            is_conformal = group.get("is_conformal", False)
+
+            if is_conformal:
+                # ── Conformal (affine) group update ──────────────────
+                p_list = group["params"]
+                gamma = p_list[0]
+                beta = p_list[1] if len(p_list) > 1 else None
+
+                self._step_conformal(gamma, beta, group)
+            else:
+                # ── SGD fallback ─────────────────────────────────────
+                for p in group["params"]:
+                    if p.grad is None:
+                        continue
+                    g = p.grad.data
+                    if wd != 0:
+                        g.add_(p.data, alpha=wd)
+                    p.data.add_(g, alpha=-lr)
+
+        return loss
+
+    def _step_conformal(
+        self,
+        gamma: torch.Tensor,
+        beta: Optional[torch.Tensor],
+        group: dict,
+    ) -> None:
+        """Apply the affine‑group (conformal) update to a  (γ, β)  pair."""
+        if gamma.grad is None:
+            return
+
+        lr = group["lr"]
+        beta1, beta2 = group["betas"]
+        eps = group["eps"]
+        wd = group["weight_decay"]
+
+        g_gamma = gamma.grad.data
+        g_beta = beta.grad.data if beta is not None and beta.grad is not None else None
+
+        # Weight decay
+        if wd != 0:
+            g_gamma.add_(gamma.data, alpha=wd)
+            if g_beta is not None:
+                g_beta.add_(beta.data, alpha=wd)
+
+        # ── Lie algebra gradients ───────────────────────────────────
+        #   g_α = γ · g_γ    (dilation generator coefficient)
+        #   g_β = g_β         (translation generator coefficient)
+        g_alpha = gamma.data * g_gamma  # shape: (d,) or scalar
+
+        # ── State ────────────────────────────────────────────────────
+        state = self.state[gamma]
+        if len(state) == 0:
+            state["step"] = 0
+            state["exp_avg_a"] = torch.zeros_like(gamma.data)
+            state["exp_avg_sq_a"] = torch.zeros_like(gamma.data)
+            if g_beta is not None:
+                state["exp_avg_b"] = torch.zeros_like(beta.data)
+                state["exp_avg_sq_b"] = torch.zeros_like(beta.data)
+
+        state["step"] += 1
+        step_t = torch.tensor(state["step"], dtype=gamma.dtype, device=gamma.device)
+
+        # ── Momentum on the Lie algebra ─────────────────────────────
+        state["exp_avg_a"].mul_(beta1).add_(g_alpha, alpha=1 - beta1)
+        state["exp_avg_sq_a"].mul_(beta2).add_(g_alpha ** 2, alpha=1 - beta2)
+
+        if g_beta is not None:
+            state["exp_avg_b"].mul_(beta1).add_(g_beta, alpha=1 - beta1)
+            state["exp_avg_sq_b"].mul_(beta2).add_(g_beta ** 2, alpha=1 - beta2)
+
+        # ── Bias correction ─────────────────────────────────────────
+        bc1 = 1 - beta1 ** step_t
+        bc2 = 1 - beta2 ** step_t
+
+        m_a = state["exp_avg_a"] / bc1
+        v_a = state["exp_avg_sq_a"] / bc2
+
+        # ── Lie algebra step ────────────────────────────────────────
+        a = -lr * m_a / (v_a.sqrt() + eps)
+
+        # ── Affine exponential update ───────────────────────────────
+        delta_gamma, delta_beta = _affine_exp(a, torch.zeros_like(a), eps)
+
+        gamma.data.mul_(delta_gamma)
+
+        if g_beta is not None:
+            m_b = state["exp_avg_b"] / bc1
+            v_b = state["exp_avg_sq_b"] / bc2
+            b = -lr * m_b / (v_b.sqrt() + eps)
+
+            # Complete affine update:  β' = e^a · β + b · (e^a - 1) / a
+            _, trans = _affine_exp(a, b, eps)
+            beta.data.mul_(delta_gamma)  # e^a · β
+            beta.data.add_(trans)  # + b · (e^a - 1) / a

@@ -20,6 +20,10 @@ keywords = [
     "muon",
     "pytorch",
     "matrix-exponential",
+    "lie-group",
+    "rotor",
+    "versor",
+    "conformal-geometric-algebra",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -29,20 +33,22 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Scientific/Engineering :: Mathematics",
 ]
+
+# PyTorch is intentionally NOT listed as a hard dependency because it is
+# platform-specific (CPU, CUDA, ROCm, MPS variants). Users install PyTorch
+# separately via https://pytorch.org/get-started/locally/ then optionally
+# install the torch extra:  pip install gamuon[torch]
+dependencies = []
 
 [project.urls]
 Homepage = "https://github.com/pebaryan/gamuon"
 Documentation = "https://github.com/pebaryan/gamuon/blob/main/docs/theory.md"
 Source = "https://github.com/pebaryan/gamuon"
 "Bug Tracker" = "https://github.com/pebaryan/gamuon/issues"
-
-# PyTorch is NOT listed as a hard dependency because it is platform-specific
-# (CPU, CUDA, ROCm, MPS variants). Users should install PyTorch 2.0+ via the
-# official guide: https://pytorch.org/get-started/locally/
-dependencies = []
 
 [project.optional-dependencies]
 torch = ["torch>=2.0.0"]

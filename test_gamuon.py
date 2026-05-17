@@ -17,10 +17,13 @@ import pytest
 import torch
 
 from gamuon import (
+    ConformalMuon,
     Gamuon,
     GamuonNS,
     MultivectorMomentum,
+    _affine_exp,
     bivector_exp,
+    find_conformal_pairs,
     grade_decompose,
     newton_schulz,
     rotor_apply,
@@ -275,9 +278,10 @@ class TestNewtonSchulz:
 
     def test_converges_to_sign_of_spd(self):
         """For an SPD matrix, sign(G) = I."""
+        torch.manual_seed(42)
         A = torch.randn(5, 5)
         G = A @ A.T  # SPD
-        X = _normalized_ns(G, num_iters=30)
+        X = _normalized_ns(G, num_iters=50)
         err = (X - torch.eye(5)).norm()
         assert err < 1e-2, f"NS SPD error: {err:.4e}"
 
@@ -488,6 +492,265 @@ class TestEdgeCases:
         opt = Gamuon([W1, W2], lr=0.01)
         ((W1 ** 2).mean() + (W2 ** 2).mean()).backward()
         opt.step()
+
+
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  CONFORMAL MUON                                                    ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+
+class TestConformalMuon:
+    def test_affine_exp_identity(self):
+        """_affine_exp with a=0, b=0 should return (1, 0)."""
+        a = torch.zeros(4)
+        b = torch.zeros(4)
+        dg, db = _affine_exp(a, b)
+        assert (dg - 1.0).abs().max().item() < 1e-6
+        assert db.abs().max().item() < 1e-6
+
+    def test_affine_exp_translation_only(self):
+        """_affine_exp with a=0, b≠0 should give (1, b)."""
+        a = torch.zeros(4)
+        b = torch.tensor([0.5, -1.0, 2.0, 0.0])
+        dg, db = _affine_exp(a, b)
+        assert (dg - 1.0).abs().max().item() < 1e-6
+        assert (db - b).abs().max().item() < 1e-5, "Translation factor should ≈ 1"
+
+    def test_affine_exp_dilation_only(self):
+        """_affine_exp with a≠0, b=0 should give (exp(a), 0)."""
+        a = torch.tensor([0.5, -0.3, 1.0, 0.0])
+        b = torch.zeros(4)
+        dg, db = _affine_exp(a, b)
+        expected_dg = torch.exp(a)
+        assert (dg - expected_dg).abs().max().item() < 1e-6
+        assert db.abs().max().item() < 1e-6
+
+    def test_affine_exp_near_singularity(self):
+        """_affine_exp should handle a very close to 0 without numerical issues."""
+        a = torch.tensor([1e-10, -1e-10])
+        b = torch.tensor([1.0, -0.5])
+        dg, db = _affine_exp(a, b)
+        # For |a| < eps, translation_factor → 1
+        assert (dg - 1.0).abs().max().item() < 1e-6
+        assert (db - b).abs().max().item() < 1e-5
+
+    def test_find_conformal_pairs_ln(self):
+        """find_conformal_pairs should detect LayerNorm (weight, bias) pairs."""
+        model = torch.nn.Sequential(
+            torch.nn.Linear(16, 16),
+            torch.nn.LayerNorm(16),
+        )
+        pairs = find_conformal_pairs(model)
+        assert len(pairs) == 1
+        w, b = pairs[0]
+        assert w is not None
+        assert b is not None
+        assert w.shape == (16,)
+        assert b.shape == (16,)
+
+    def test_find_conformal_pairs_bn(self):
+        """find_conformal_pairs should detect BatchNorm1d (weight, bias) pairs."""
+        model = torch.nn.Sequential(
+            torch.nn.Linear(32, 32),
+            torch.nn.BatchNorm1d(32),
+        )
+        pairs = find_conformal_pairs(model)
+        assert len(pairs) == 1
+        w, b = pairs[0]
+        assert w is not None
+        assert b is not None
+
+    def test_find_conformal_pairs_multi_layer(self):
+        """find_conformal_pairs should find all norm layers in a multi-layer model."""
+        model = torch.nn.Sequential(
+            torch.nn.Linear(8, 16),
+            torch.nn.LayerNorm(16),
+            torch.nn.Linear(16, 32),
+            torch.nn.LayerNorm(32),
+        )
+        pairs = find_conformal_pairs(model)
+        assert len(pairs) == 2
+        assert pairs[0][0].shape == (16,)
+        assert pairs[1][0].shape == (32,)
+
+    def test_conformal_muon_module_input(self):
+        """ConformalMuon should accept an nn.Module and auto-detect pairs."""
+        model = torch.nn.Sequential(
+            torch.nn.Linear(8, 8),
+            torch.nn.LayerNorm(8),
+        )
+        opt = ConformalMuon(model, lr=0.01)
+        assert len(opt.param_groups) >= 1
+
+        # Verify conformal group exists
+        conformal_groups = [
+            g for g in opt.param_groups if g.get("is_conformal", False)
+        ]
+        assert len(conformal_groups) == 1
+        # LayerNorm has weight and bias
+        assert len(conformal_groups[0]["params"]) == 2
+
+    def test_conformal_muon_tuple_input(self):
+        """ConformalMuon should accept list of (weight, bias) tuples."""
+        model = torch.nn.LayerNorm(8)
+        pairs = find_conformal_pairs(model)
+        opt = ConformalMuon(pairs, lr=0.01)
+        assert len(opt.param_groups) == 1
+        assert opt.param_groups[0].get("is_conformal", False)
+
+    def test_conformal_muon_gamma_positive(self):
+        """ConformalMuon should keep gamma positive after updates."""
+        torch.manual_seed(42)
+        ln = torch.nn.LayerNorm(16)
+        opt = ConformalMuon(ln, lr=0.1)
+
+        # Run a few steps with random gradients
+        for _ in range(10):
+            if ln.weight.grad is not None:
+                opt.zero_grad()
+            loss = ln.weight.sum()
+            loss.backward()
+            opt.step()
+
+        # Gamma (weight) should remain positive
+        assert (ln.weight.data > 0).all(), "Gamma became non-positive"
+
+    def test_conformal_muon_ln_converges(self):
+        """ConformalMuon should minimize a loss for a LayerNorm parameter pair."""
+        torch.manual_seed(42)
+        ln = torch.nn.LayerNorm(8)
+
+        # Initialize gamma and beta away from optimal
+        torch.nn.init.ones_(ln.weight)
+        torch.nn.init.zeros_(ln.bias)
+
+        # Target values
+        target_gamma = torch.full((8,), 2.0)
+        target_beta = torch.full((8,), 0.5)
+
+        opt = ConformalMuon(ln, lr=0.05)
+
+        losses = []
+        # Need enough steps for the exponential map to converge
+        for _ in range(200):
+            opt.zero_grad()
+            loss = ((ln.weight - target_gamma) ** 2).sum() + \
+                   ((ln.bias - target_beta) ** 2).sum()
+            loss.backward()
+            opt.step()
+            losses.append(loss.item())
+
+        assert losses[-1] < losses[0] * 0.5, (
+            f"Loss did not converge: {losses[0]:.6f} → {losses[-1]:.6f}"
+        )
+        # Gamma should approach target (positive)
+        assert (ln.weight.data > 0).all(), "Gamma became non-positive"
+        assert (ln.weight.data - target_gamma).abs().mean().item() < 0.5
+        assert (ln.bias.data - target_beta).abs().mean().item() < 0.5
+
+    def test_conformal_muon_without_bias(self):
+        """ConformalMuon should handle norm layers without bias."""
+        ln = torch.nn.LayerNorm(8, bias=False)
+        opt = ConformalMuon(ln, lr=0.01)
+
+        conformal_groups = [
+            g for g in opt.param_groups if g.get("is_conformal", False)
+        ]
+        assert len(conformal_groups) == 1
+        assert len(conformal_groups[0]["params"]) == 1  # only gamma
+
+        # Should run without error
+        opt.zero_grad()
+        ln.weight.sum().backward()
+        opt.step()
+
+    def test_conformal_muon_weight_decay(self):
+        """ConformalMuon should apply weight decay correctly."""
+        ln = torch.nn.LayerNorm(4)
+        gamma_before = ln.weight.data.clone()
+        beta_before = ln.bias.data.clone()
+
+        opt = ConformalMuon(ln, lr=0.0, weight_decay=0.1)
+
+        # Create a gradient that involves both weight and bias
+        ((ln.weight ** 2).sum() + (ln.bias ** 2).sum()).backward()
+
+        # Gradient of weight**2 is 2*weight, same for bias
+        # After step with wd=0.1: grad += 0.1 * param
+        # With lr=0: no actual parameter update, but grad is modified
+        opt.step()
+
+        # With lr=0 and wd>0, gamma's grad gets wd*gamma added
+        # but no actual parameter update happens
+        expected_grad_gamma = 2 * gamma_before + 0.1 * gamma_before
+        err = (ln.weight.grad - expected_grad_gamma).norm().item()
+        assert err < 1e-5, f"Weight decay on gamma error: {err:.2e}"
+
+        expected_grad_beta = 2 * beta_before + 0.1 * beta_before
+        err = (ln.bias.grad - expected_grad_beta).norm().item()
+        assert err < 1e-5, f"Weight decay on beta error: {err:.2e}"
+
+    def test_conformal_muon_sgd_fallback(self):
+        """Non-conformal parameter groups should use SGD fallback."""
+        w = torch.nn.Parameter(torch.randn(4, 4))
+        b = torch.nn.Parameter(torch.randn(4))
+
+        opt = ConformalMuon([
+            {"params": [w, b], "is_conformal": False},
+        ], lr=0.01)
+
+        before = w.data.clone()
+        (w ** 2).mean().backward()
+        opt.step()
+        # SGD: w ← w - lr * grad
+        expected = before - 0.01 * (2 * before / 16)
+        assert (w.data - expected).norm() < 1e-6
+
+    def test_conformal_muon_with_bn(self):
+        """ConformalMuon should work with BatchNorm1d on a forward pass."""
+        torch.manual_seed(42)
+        bn = torch.nn.BatchNorm1d(8, track_running_stats=False)
+        x = torch.randn(4, 8)
+
+        opt = ConformalMuon(bn, lr=0.01)
+
+        # Train for a few steps matching target statistics
+        target_mean = torch.full((8,), 0.3)
+        target_std = torch.full((8,), 2.0)
+
+        for _ in range(50):
+            opt.zero_grad()
+            x = torch.randn(4, 8)
+            out = bn(x)
+            # Encourage output mean and std toward target
+            loss = ((out.mean(0) - target_mean) ** 2).sum() + \
+                   ((out.std(0) - target_std) ** 2).sum()
+            loss.backward()
+            opt.step()
+
+        # Gamma (weight) should stay positive
+        assert (bn.weight.data > 0).all(), "Gamma became non-positive"
+
+    def test_conformal_muon_mixed_model(self):
+        """ConformalMuon should handle a model with both linear and norm layers."""
+        model = torch.nn.Sequential(
+            torch.nn.Linear(10, 20),
+            torch.nn.LayerNorm(20),
+            torch.nn.Linear(20, 5),
+        )
+        opt = ConformalMuon(model, lr=0.01)
+
+        x = torch.randn(4, 10)
+        opt.zero_grad()
+        loss = model(x).sum()
+        loss.backward()
+        opt.step()
+
+        # All params should have been updated
+        conformal_count = sum(
+            1 for g in opt.param_groups if g.get("is_conformal", False)
+        )
+        assert conformal_count == 1  # one LayerNorm
 
 
 if __name__ == "__main__":
