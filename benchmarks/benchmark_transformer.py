@@ -27,7 +27,8 @@ import torch.nn.functional as F
 # ── Gamuon ──────────────────────────────────────────────────────────────
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from gamuon import Gamuon, GamuonNS, grade_decompose, newton_schulz
+from gamuon import (Gamuon, GamuonNS, grade_decompose, newton_schulz,
+                       ConformalMuon, find_conformal_pairs)
 
 
 # ╔══════════════════════════════════════════════════════════════════════╗
@@ -345,8 +346,18 @@ def plot_results(
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
-    colors = {"Gamuon": "#4C72B0", "Muon (NS)": "#DD8452", "Adam": "#55A868"}
-    markers = {"Gamuon": "o", "Muon (NS)": "s", "Adam": "^"}
+    colors = {
+        "Gamuon": "#4C72B0",
+        "Gamuon+Conf": "#8E44AD",
+        "Muon (NS)": "#DD8452",
+        "Adam": "#55A868",
+    }
+    markers = {
+        "Gamuon": "o",
+        "Gamuon+Conf": "D",
+        "Muon (NS)": "s",
+        "Adam": "^",
+    }
 
     # ── Loss vs steps ──────────────────────────────────────────────
     ax = axes[0, 0]
@@ -421,7 +432,7 @@ def plot_results(
     ax.grid(True, alpha=0.3, axis="y")
 
     fig.suptitle(
-        "Gamuon vs Muon (Newton-Schulz) vs Adam  —  Small Transformer",
+        "Optimizer Comparison  —  Small Transformer",
         fontsize=14, fontweight="bold",
     )
     plt.tight_layout()
@@ -485,10 +496,14 @@ def main():
         ).to(device)
 
     # ── Define optimizers ──────────────────────────────────────────
-    # Gamuon supports only 2D params; non-2D (biases, norms) get SGD.
-    # Muon handles matrix params with NS + SGD fallback for non-2D.
-    # Adam handles everything with Adam (standard baseline).
-    # This ensures all optimizers update the same set of parameters.
+    # Gamuon w/ SGD fallback:   Garnuon for 2D matrix params,
+    #                            SGD for biases & norm params.
+    # Gamuon+Conf:               Gamuon for matrix params,
+    #                            ConformalMuon for norm (γ, β),
+    #                            SGD for remaining non-2D params.
+    # Muon:                      NS projection for 2D + SGD for rest.
+    # Adam:                      Standard baseline (all params).
+
     def make_gamuon(model):
         groups = get_param_groups(model, args.lr)
         matrix_group = None
@@ -499,19 +514,55 @@ def main():
             else:
                 other_group = {"params": g["params"], "lr": g["lr"]}
 
-        # Gamuon for 2D matrix params
         gamuon_opt = Gamuon(
             [matrix_group] if matrix_group else [],
             lr=args.lr,
             betas=(0.9, 0.999),
             weight_decay=0.0,
         )
-        # SGD for non-2D params (biases, norms)
         sgd_opt = torch.optim.SGD(
             [other_group] if other_group else [],
             lr=args.lr,
         )
         return CombinedOptimizer(gamuon_opt, sgd_opt)
+
+    def make_gamuon_conformal(model):
+        """Gamuon for matrix weights + ConformalMuon for norm (γ, β)."""
+        # Detect norm-layer parameter pairs
+        pairs = find_conformal_pairs(model)
+        conformal_ids = set()
+        for w, b in pairs:
+            conformal_ids.add(id(w))
+            if b is not None:
+                conformal_ids.add(id(b))
+
+        # Partition remaining params: 2D → Gamuon, rest → SGD
+        matrix_params = []
+        other_params = []
+        for _, p in model.named_parameters():
+            if id(p) in conformal_ids:
+                continue
+            if p.ndim == 2:
+                matrix_params.append(p)
+            else:
+                other_params.append(p)
+
+        gamuon_opt = Gamuon(
+            [{"params": matrix_params, "lr": args.lr}] if matrix_params else [],
+            lr=args.lr,
+            betas=(0.9, 0.999),
+            weight_decay=0.0,
+        )
+        conformal_opt = ConformalMuon(
+            pairs,
+            lr=args.lr,
+            betas=(0.9, 0.999),
+        )
+        sgd_opt = torch.optim.SGD(
+            [{"params": other_params, "lr": args.lr}] if other_params else [],
+            lr=args.lr,
+        )
+        return CombinedOptimizer(gamuon_opt, conformal_opt, sgd_opt)
 
     def make_muon(model):
         return MuonOptimizer(
@@ -531,6 +582,7 @@ def main():
 
     optimizers = [
         ("Gamuon", make_gamuon),
+        ("Gamuon+Conf", make_gamuon_conformal),
         ("Muon (NS)", make_muon),
         ("Adam", make_adam),
     ]
