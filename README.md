@@ -465,10 +465,10 @@ The test suite covers:
 If you use Gamuon in your research, please cite:
 
 ```bibtex
-@software{gamuon2025,
+@software{gamuon2026,
   author = {Peb Ruswono Aryan},
   title = {Gamuon: Geometric (Clifford) Algebra-native Optimizer},
-  year = {2025},
+  year = {2026},
   url = {https://github.com/pebaryan/gamuon}
 }
 ```
