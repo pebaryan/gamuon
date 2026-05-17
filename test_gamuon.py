@@ -19,7 +19,9 @@ import torch
 from gamuon import (
     ConformalMuon,
     Gamuon,
+    GamuonAuto,
     GamuonNS,
+    GradNormMonitor,
     MultivectorMomentum,
     _affine_exp,
     bivector_exp,
@@ -765,6 +767,20 @@ class TestConformalMuon:
         assert b is None  # RMSNorm has no bias
         assert w.shape == (32,)
 
+    def test_find_conformal_pairs_groupnorm(self):
+        """find_conformal_pairs should detect GroupNorm (weight, bias) pairs."""
+        model = torch.nn.Sequential(
+            torch.nn.Linear(16, 32),
+            torch.nn.GroupNorm(4, 32),  # 4 groups, 32 channels
+        )
+        pairs = find_conformal_pairs(model)
+        assert len(pairs) == 1
+        w, b = pairs[0]
+        assert w is not None
+        assert b is not None  # GroupNorm has bias (affine=True by default)
+        assert w.shape == (32,)
+        assert b.shape == (32,)
+
     def test_find_conformal_pairs_weightnorm(self):
         """find_conformal_pairs should detect weight_norm weight_g parameters."""
         model = torch.nn.Sequential(
@@ -808,6 +824,593 @@ class TestConformalMuon:
         assert (torch.Size([16]), False) in norm_types  # RMSNorm
         assert (torch.Size([8]), True) in norm_types    # LayerNorm
         assert (torch.Size([16]), False) in norm_types  # weight_g
+
+    def test_find_conformal_pairs_conv_weightnorm(self):
+        """find_conformal_pairs should detect weight_g from Conv2d with weight_norm.
+
+        Conv2d weight_g has shape (out_channels, 1, 1, 1) — 4D with
+        three singleton spatial dims. The generalised 1-D scale check
+        sum(s > 1 for s in shape) == 1 should catch it.
+        """
+        model = torch.nn.Sequential(
+            torch.nn.Conv2d(3, 16, 3),
+            torch.nn.LayerNorm(16),
+        )
+        torch.nn.utils.weight_norm(model[0], name="weight")
+        pairs = find_conformal_pairs(model)
+
+        # Should find both the LayerNorm pair and the Conv2d weight_g
+        ln_pairs = [(w, b) for w, b in pairs if b is not None]
+        wn_pairs = [(w, b) for w, b in pairs if b is None]
+
+        assert len(ln_pairs) == 1  # LayerNorm(16)
+        assert len(wn_pairs) == 1  # weight_g from Conv2d
+
+        wg = wn_pairs[0][0]
+        # weight_g is (out_channels, 1, 1, 1) — 4D with spatial singletons
+        assert wg.dim() == 4
+        assert wg.shape == (16, 1, 1, 1)
+        assert wg.shape[0] > 1  # out_channels
+        assert sum(1 for s in wg.shape if s > 1) == 1  # exactly 1 non-singleton dim
+
+    def test_find_conformal_pairs_conv1d_weightnorm(self):
+        """find_conformal_pairs should detect weight_g from Conv1d with weight_norm.
+
+        Conv1d weight_g has shape (out_channels, 1, 1) — 3D with two
+        singleton spatial dims. Verifies the generalised 1-D scale check
+        sum(s > 1 for s in shape) == 1 also works for 3D tensors.
+        """
+        model = torch.nn.Sequential(
+            torch.nn.Conv1d(3, 16, 3),
+            torch.nn.LayerNorm(16),
+        )
+        torch.nn.utils.weight_norm(model[0], name="weight")
+        pairs = find_conformal_pairs(model)
+
+        ln_pairs = [(w, b) for w, b in pairs if b is not None]
+        wn_pairs = [(w, b) for w, b in pairs if b is None]
+
+        assert len(ln_pairs) == 1  # LayerNorm(16)
+        assert len(wn_pairs) == 1  # weight_g from Conv1d
+
+        wg = wn_pairs[0][0]
+        # weight_g is (out_channels, 1, 1) — 3D with spatial singletons
+        assert wg.dim() == 3
+        assert wg.shape == (16, 1, 1)
+        assert wg.shape[0] > 1  # out_channels
+        assert sum(1 for s in wg.shape if s > 1) == 1  # exactly 1 non-singleton dim
+
+
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  GAMUON AUTO META-OPTIMIZER                                        ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+
+class TestGamuonAuto:
+    """Verify GamuonAuto correctly partitions parameters into
+    ConformalMuon / Gamuon / SGD sub-optimizers."""
+
+    def test_auto_partitions_basic_model(self):
+        """A model with Linear + LayerNorm should create all three sub-optimizers."""
+        model = torch.nn.Sequential(
+            torch.nn.Linear(32, 64),
+            torch.nn.LayerNorm(64),
+            torch.nn.Linear(64, 16),
+            torch.nn.LayerNorm(16),
+        )
+        opt = GamuonAuto(model, lr=1e-3)
+
+        # All three sub-optimizers should exist and have work
+        assert opt._conformal is not None, "ConformalMuon should exist"
+        assert opt._gamuon is not None, "Gamuon should exist"
+        assert opt._sgd is not None, "SGD should exist"
+        assert len(opt._optimizers) == 3
+
+        # ConformalMuon should have one param group per norm pair (4 params total)
+        total_conf_params = sum(
+            len(g["params"]) for g in opt._conformal.param_groups
+            if g.get("is_conformal", False)
+        )
+        # 2 LayerNorm layers, each with weight + bias = 4 params
+        assert total_conf_params == 4, f"Expected 4 conformal params, got {total_conf_params}"
+
+        # SGD should have biases from the Linear layers (bias=True by default)
+        total_sgd_params = sum(
+            len(g["params"]) for g in opt._sgd.param_groups
+        )
+        # 2 Linear biases = 2 params
+        assert total_sgd_params == 2, f"Expected 2 SGD params, got {total_sgd_params}"
+
+    def test_auto_no_norm_layers(self):
+        """A model without norm layers should have no ConformalMuon."""
+        model = torch.nn.Sequential(
+            torch.nn.Linear(32, 64),
+            torch.nn.ReLU(),
+            torch.nn.Linear(64, 16),
+        )
+        opt = GamuonAuto(model, lr=1e-3)
+
+        assert opt._conformal is None, "No norm layers → no ConformalMuon"
+        assert opt._gamuon is not None, "Should have Gamuon for 2D weights"
+        assert opt._sgd is not None, "Should have SGD for 1D biases"
+        assert len(opt._optimizers) == 2
+
+    def test_auto_only_norm_layers(self):
+        """A model with only norm layers should have only ConformalMuon and SGD."""
+        model = torch.nn.Sequential(
+            torch.nn.LayerNorm(32),
+            torch.nn.LayerNorm(16),
+        )
+        opt = GamuonAuto(model, lr=1e-3)
+
+        assert opt._conformal is not None
+        # LayerNorm weights/bias are 1D, so they go to ConformalMuon
+        # No 2D params → no Gamuon
+        assert opt._gamuon is None, "No 2D params → no Gamuon"
+        # No other params → no SGD
+        assert opt._sgd is None, "All params are conformal → no SGD"
+        assert len(opt._optimizers) == 1
+
+    def test_auto_weight_norm(self):
+        """GamuonAuto should detect weight_norm parameters."""
+        model = torch.nn.Sequential(
+            torch.nn.Linear(8, 16),
+            torch.nn.LayerNorm(16),
+        )
+        torch.nn.utils.weight_norm(model[0], name="weight")
+        opt = GamuonAuto(model, lr=1e-3)
+
+        # ConformalMuon should have both the LayerNorm pair and the weight_g
+        total_conf_params = sum(
+            len(g["params"]) for g in opt._conformal.param_groups
+        )
+        # LayerNorm(16) weight+bias (2) + weight_g (1) = 3
+        assert total_conf_params == 3, f"Expected 3 conformal params, got {total_conf_params}"
+
+        # weight_g is 1D, so the Linear's weight (now parametrized) is also 1D → SGD
+        assert opt._gamuon is not None, "Should still have Gamuon for remaining 2D params"
+
+    def test_auto_rmsnorm_groupnorm(self):
+        """GamuonAuto should detect RMSNorm (weight-only) and GroupNorm."""
+        model = torch.nn.Sequential(
+            torch.nn.Linear(16, 32),
+            torch.nn.RMSNorm(32),
+            torch.nn.Linear(32, 16),
+            torch.nn.GroupNorm(4, 16),
+        )
+        opt = GamuonAuto(model, lr=1e-3)
+
+        total_conf_groups = len([
+            g for g in opt._conformal.param_groups
+            if g.get("is_conformal", False)
+        ])
+        # RMSNorm(32) + GroupNorm(4, 16) = 2 groups
+        assert total_conf_groups == 2, f"Expected 2 conformal groups, got {total_conf_groups}"
+
+        # RMSNorm has weight only (1 param), GroupNorm has weight+bias (2 params)
+        # → 3 total conformal params
+        total_conf_params = sum(
+            len(g["params"]) for g in opt._conformal.param_groups
+        )
+        assert total_conf_params == 3, f"Expected 3 conformal params, got {total_conf_params}"
+
+    def test_auto_empty_model(self):
+        """An empty model should create no sub-optimizers."""
+        model = torch.nn.Sequential()
+        opt = GamuonAuto(model, lr=1e-3)
+
+        assert opt._conformal is None
+        assert opt._gamuon is None
+        assert opt._sgd is None
+        assert len(opt._optimizers) == 0
+
+    def test_auto_training_step(self):
+        """A full training step with GamuonAuto should update all params and reduce loss."""
+        torch.manual_seed(42)
+        model = torch.nn.Sequential(
+            torch.nn.Linear(8, 16),
+            torch.nn.LayerNorm(16),
+            torch.nn.Linear(16, 4),
+        )
+        opt = GamuonAuto(model, lr=1e-2)
+        x = torch.randn(4, 8)
+        target = torch.randn(4, 4)
+
+        # Get initial state
+        params_before = [p.data.clone() for p in model.parameters()]
+
+        loss = ((model(x) - target) ** 2).mean()
+        loss.backward()
+        opt.step()
+
+        # All params should have been updated
+        for p, before in zip(model.parameters(), params_before):
+            assert (p.data - before).abs().sum().item() > 0, "Parameter was not updated"
+
+    def test_auto_state_dict_structure(self):
+        """state_dict should have expected structure with sub-keys for each
+        active sub-optimizer."""
+        torch.manual_seed(42)
+        model = torch.nn.Sequential(
+            torch.nn.Linear(8, 16),
+            torch.nn.LayerNorm(16),
+        )
+        opt = GamuonAuto(model, lr=1e-2)
+
+        # Run a few steps to build state
+        for _ in range(5):
+            x = torch.randn(4, 8)
+            ((model(x) ** 2).mean()).backward()
+            opt.step()
+
+        state = opt.state_dict()
+
+        # Should have sub-keys for each active sub-optimizer
+        assert "conformal" in state
+        assert "gamuon" in state
+        assert "sgd" in state
+
+        # Each sub-state should be a valid optimizer state dict
+        for key in ("conformal", "gamuon", "sgd"):
+            assert "param_groups" in state[key], (
+                f"Sub-state '{key}' missing param_groups"
+            )
+            assert len(state[key]["param_groups"]) > 0
+            # Params are stored as IDs (ints) in the state dict
+            for g in state[key]["param_groups"]:
+                assert "params" in g
+                for p_id in g["params"]:
+                    assert isinstance(p_id, int)
+
+    def test_auto_state_dict_same_instance_roundtrip(self):
+        """state_dict -> load_state_dict on the same optimizer instance
+        should produce identical updates (parameter IDs match within one
+        optimizer)."""
+        torch.manual_seed(42)
+        model = torch.nn.Sequential(
+            torch.nn.Linear(8, 16),
+            torch.nn.LayerNorm(16),
+        )
+        opt = GamuonAuto(model, lr=1e-2)
+
+        # Run a few steps to build momentum state
+        for _ in range(5):
+            x = torch.randn(4, 8)
+            ((model(x) ** 2).mean()).backward()
+            opt.step()
+
+        # Save state
+        state = opt.state_dict()
+
+        # Reset model weights so load_state_dict has observable effect
+        for p in model.parameters():
+            torch.nn.init.normal_(p)
+
+        # Reset weights, load saved state, run a step
+        for p in model.parameters():
+            torch.nn.init.normal_(p)
+        opt.load_state_dict(state)
+
+        x = torch.randn(4, 8)
+        ((model(x) ** 2).mean()).backward()
+        opt.step()
+
+        # Verify load_state_dict doesn't crash and produces valid params
+        assert all(torch.isfinite(p).all() for p in model.parameters())
+
+    def test_auto_scale_invariant_ln_converges(self):
+        """GamuonAuto should minimise a loss with LayerNorm present."""
+        torch.manual_seed(42)
+        model = torch.nn.Sequential(
+            torch.nn.Linear(8, 8),
+            torch.nn.LayerNorm(8),
+            torch.nn.Linear(8, 4),
+        )
+        opt = GamuonAuto(model, lr=5e-3)
+        x = torch.randn(16, 8)
+        target = torch.randn(16, 4)
+
+        losses = []
+        for _ in range(50):
+            opt.zero_grad()
+            loss = ((model(x) - target) ** 2).mean()
+            loss.backward()
+            opt.step()
+            losses.append(loss.item())
+
+        assert losses[-1] < losses[0] * 0.8, (
+            f"Loss did not converge: {losses[0]:.6f} → {losses[-1]:.6f}"
+        )
+
+    def test_auto_output_shape(self):
+        """Verify model output changes after a GamuonAuto step (sanity)."""
+        model = torch.nn.Sequential(
+            torch.nn.Linear(8, 16),
+            torch.nn.LayerNorm(16),
+        )
+        opt = GamuonAuto(model, lr=1e-2)
+        x = torch.randn(4, 8)
+
+        out_before = model(x).clone()
+        ((model(x) ** 2).mean()).backward()
+        opt.step()
+        out_after = model(x)
+
+        # Outputs should differ after an update
+        diff = (out_before - out_after).abs().max().item()
+        assert diff > 0, "Output unchanged after optimizer step"
+
+
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  GRADIENT NORM MONITOR                                              ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+
+class TestGradNormMonitor:
+    """Verify GradNormMonitor captures correct gradient norm metrics
+    across all three GamuonAuto sub-optimizer roles."""
+
+    def test_capture_returns_all_active_roles(self):
+        """capture() should return a dict keyed by active sub-optimizer roles."""
+        model = torch.nn.Sequential(
+            torch.nn.Linear(8, 16),
+            torch.nn.LayerNorm(16),
+        )
+        opt = GamuonAuto(model, lr=1e-3)
+        monitor = GradNormMonitor(opt, silent=True)
+
+        x = torch.randn(4, 8)
+        loss = (model(x) ** 2).mean()
+        loss.backward()
+
+        result = monitor.capture(step=0)
+
+        # All three roles should be present
+        assert "conformal" in result
+        assert "gamuon" in result
+        assert "sgd" in result
+
+        # Each result should have the expected keys
+        for role_result in result.values():
+            assert "total_norm" in role_result
+            assert "mean_norm" in role_result
+            assert "max_norm" in role_result
+            assert "num_params" in role_result
+            assert "zero_frac" in role_result
+
+    def test_capture_norms_are_positive(self):
+        """After a backward pass, gradient norms should be strictly positive."""
+        model = torch.nn.Sequential(
+            torch.nn.Linear(8, 16),
+            torch.nn.LayerNorm(16),
+        )
+        opt = GamuonAuto(model, lr=1e-3)
+        monitor = GradNormMonitor(opt, silent=True)
+
+        x = torch.randn(4, 8)
+        loss = (model(x) ** 2).mean()
+        loss.backward()
+
+        result = monitor.capture()
+
+        for role_result in result.values():
+            assert role_result["total_norm"] > 0.0
+            assert role_result["mean_norm"] > 0.0
+            assert role_result["max_norm"] > 0.0
+
+    def test_capture_without_backward_zeros(self):
+        """Without a backward pass, gradients are None — zero_frac should be 1."""
+        model = torch.nn.Sequential(
+            torch.nn.Linear(8, 16),
+            torch.nn.LayerNorm(16),
+        )
+        opt = GamuonAuto(model, lr=1e-3)
+        monitor = GradNormMonitor(opt, silent=True)
+
+        # No backward pass — all grads are None
+        result = monitor.capture()
+
+        for role_result in result.values():
+            assert role_result["zero_frac"] == 1.0
+            assert role_result["total_norm"] == 0.0
+
+    def test_capture_after_zero_grad(self):
+        """After zero_grad (without new backward), gradients should be zero
+        but not None — total_norm = 0, zero_frac < 1 but total_norm = 0."""
+        model = torch.nn.Sequential(
+            torch.nn.Linear(8, 16),
+            torch.nn.LayerNorm(16),
+        )
+        opt = GamuonAuto(model, lr=1e-3)
+        monitor = GradNormMonitor(opt, silent=True)
+
+        x = torch.randn(4, 8)
+        loss = (model(x) ** 2).mean()
+        loss.backward()
+        opt.step()
+        opt.zero_grad()
+
+        result = monitor.capture()
+
+        for role_result in result.values():
+            assert role_result["total_norm"] == 0.0
+            # Grads are zeroed (not None), so all are counted as zero
+
+    def test_capture_after_step_zero_grad(self):
+        """Full forward → backward → step → zero_grad cycle, norms should be
+        positive before step and zero after zero_grad."""
+        model = torch.nn.Sequential(
+            torch.nn.Linear(8, 16),
+            torch.nn.LayerNorm(16),
+        )
+        opt = GamuonAuto(model, lr=1e-3)
+        monitor = GradNormMonitor(opt, silent=True)
+
+        x = torch.randn(4, 8)
+
+        # Forward + backward
+        loss = (model(x) ** 2).mean()
+        loss.backward()
+
+        result_before = monitor.capture(step=0)
+        for role_result in result_before.values():
+            assert role_result["total_norm"] > 0.0, \
+                "Expected positive norms before step"
+
+        opt.step()
+        opt.zero_grad()
+
+        result_after = monitor.capture(step=1)
+        for role_result in result_after.values():
+            assert role_result["total_norm"] == 0.0, \
+                "Expected zero norms after step + zero_grad"
+
+    def test_summary_returns_aggregated_stats(self):
+        """summary() should return mean, std, min, max, last per role."""
+        model = torch.nn.Sequential(
+            torch.nn.Linear(8, 16),
+            torch.nn.LayerNorm(16),
+        )
+        opt = GamuonAuto(model, lr=1e-3)
+        monitor = GradNormMonitor(opt, silent=True)
+
+        x = torch.randn(4, 8)
+
+        for step in range(5):
+            opt.zero_grad()
+            loss = (model(x) ** 2).mean()
+            loss.backward()
+            monitor.capture(step=step)
+            opt.step()
+
+        summary = monitor.summary()
+
+        for role in ("conformal", "gamuon", "sgd"):
+            assert role in summary, f"Missing role: {role}"
+            s = summary[role]
+            assert s["count"] == 5
+            assert s["mean"] > 0.0
+            assert s["std"] >= 0.0
+            assert 0.0 <= s["min"] <= s["max"]
+            assert s["last"] > 0.0
+            assert 0.0 <= s["zero_frac_mean"] <= 1.0
+
+    def test_reset_clears_history(self):
+        """reset() should clear all recorded history."""
+        model = torch.nn.Sequential(
+            torch.nn.Linear(8, 16),
+            torch.nn.LayerNorm(16),
+        )
+        opt = GamuonAuto(model, lr=1e-3)
+        monitor = GradNormMonitor(opt, silent=True)
+
+        x = torch.randn(4, 8)
+        loss = (model(x) ** 2).mean()
+        loss.backward()
+        monitor.capture()
+
+        summary_before = monitor.summary()
+        assert summary_before["gamuon"]["count"] == 1
+
+        monitor.reset()
+        summary_after = monitor.summary()
+        assert summary_after["gamuon"]["count"] == 0
+
+    def test_log_freq_zero_no_output(self, capsys):
+        """With log_freq=0, capture() should not print anything."""
+        model = torch.nn.Sequential(torch.nn.Linear(4, 4))
+        opt = GamuonAuto(model, lr=1e-3)
+        monitor = GradNormMonitor(opt, log_freq=0)
+
+        x = torch.randn(2, 4)
+        loss = (model(x) ** 2).mean()
+        loss.backward()
+        monitor.capture()
+
+        captured = capsys.readouterr()
+        assert captured.out == "", f"Expected no output, got: {captured.out}"
+
+    def test_log_freq_one_prints(self, capsys):
+        """With log_freq=1, capture() should print gradient norms."""
+        model = torch.nn.Sequential(
+            torch.nn.Linear(8, 16),
+            torch.nn.LayerNorm(16),
+        )
+        opt = GamuonAuto(model, lr=1e-3)
+        monitor = GradNormMonitor(opt, log_freq=1)
+
+        x = torch.randn(4, 8)
+        loss = (model(x) ** 2).mean()
+        loss.backward()
+        monitor.capture(step=42)
+
+        captured = capsys.readouterr()
+        assert "grad_norm" in captured.out
+        assert "conformal:" in captured.out
+        assert "gamuon:" in captured.out
+        assert "sgd:" in captured.out
+
+    def test_only_gamuon_active(self):
+        """A model with only 2-D params (no norms, no 1-D) → only gamuon role."""
+        model = torch.nn.Sequential(torch.nn.Linear(4, 4))
+        # No bias to avoid 1-D params going to SGD
+        model[0].bias = None
+        opt = GamuonAuto(model, lr=1e-3)
+        monitor = GradNormMonitor(opt, silent=True)
+
+        x = torch.randn(2, 4)
+        loss = (model(x) ** 2).mean()
+        loss.backward()
+
+        result = monitor.capture()
+        assert "gamuon" in result
+        assert "conformal" not in result
+        # SGD might or might not exist — depends on remaining params
+
+    def test_multiple_steps_track_history_length(self):
+        """After N captures, each role should have N entries in history."""
+        model = torch.nn.Sequential(
+            torch.nn.Linear(8, 16),
+            torch.nn.LayerNorm(16),
+        )
+        opt = GamuonAuto(model, lr=1e-3)
+        monitor = GradNormMonitor(opt, silent=True)
+
+        x = torch.randn(4, 8)
+
+        for step in range(10):
+            opt.zero_grad()
+            loss = (model(x) ** 2).mean()
+            loss.backward()
+            monitor.capture(step=step)
+            opt.step()
+
+        summary = monitor.summary()
+        for role in ("conformal", "gamuon", "sgd"):
+            assert summary[role]["count"] == 10, \
+                f"Expected 10 entries for {role}, got {summary[role]['count']}"
+
+    def test_num_params_correct(self):
+        """num_params should reflect the actual number of parameters per role."""
+        model = torch.nn.Sequential(
+            torch.nn.Linear(8, 16),    # weight: 8×16=128, bias: 16
+            torch.nn.LayerNorm(16),    # weight: 16, bias: 16
+        )
+        opt = GamuonAuto(model, lr=1e-3)
+        monitor = GradNormMonitor(opt, silent=True)
+
+        x = torch.randn(4, 8)
+        loss = (model(x) ** 2).mean()
+        loss.backward()
+
+        result = monitor.capture()
+
+        # Linear(8→16) weight is 2D → Gamuon
+        assert result["gamuon"]["num_params"] == 1  # one weight matrix
+        # LayerNorm(16) weight+bias = 2 conformal params
+        assert result["conformal"]["num_params"] == 2  # gamma + beta
+        # Linear bias is 1D → SGD
+        assert result["sgd"]["num_params"] == 1
 
 
 if __name__ == "__main__":

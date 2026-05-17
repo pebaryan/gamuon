@@ -1031,3 +1031,238 @@ class GamuonAuto:
             self._gamuon.load_state_dict(state_dict["gamuon"])
         if self._sgd and "sgd" in state_dict:
             self._sgd.load_state_dict(state_dict["sgd"])
+
+
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  GRADIENT NORM MONITOR                                             ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+
+class GradNormMonitor:
+    """Monitor and log gradient norms across GamuonAuto\u2019s sub-optimizers.
+
+    Captures the L2 norm of gradients for each sub-optimizer role
+    (``conformal``, ``gamuon``, ``sgd``) at each call to :meth:`capture`.
+    Useful for debugging gradient flow, tuning learning rates, and
+    detecting vanishing / exploding gradients.
+
+    Parameters
+    ----------
+    optimizer : GamuonAuto
+        The optimiser whose parameters\u2019 gradients will be monitored.
+    log_freq : int, default 1
+        How often to print a summary line (1 = every call to ``capture()``).
+        Set to 0 to suppress live logging.
+    silent : bool, default False
+        If True, suppress all console output (still stores history).
+
+    Example
+    -------
+    >>> model = nn.Sequential(nn.Linear(64, 64), nn.LayerNorm(64))
+    >>> opt = GamuonAuto(model, lr=1e-3)
+    >>> monitor = GradNormMonitor(opt, log_freq=10)
+    >>> for step in range(100):
+    ...     loss = model(x).sum()
+    ...     opt.zero_grad()
+    ...     loss.backward()
+    ...     monitor.capture(step)
+    ...     opt.step()
+    >>> stats = monitor.summary()
+    >>> # monitor.plot() if matplotlib is available
+    """
+
+    def __init__(
+        self,
+        optimizer: GamuonAuto,
+        log_freq: int = 1,
+        silent: bool = False,
+    ):
+        self._optimizer = optimizer
+        self._log_freq = log_freq
+        self._silent = silent
+
+        # Map sub-optimizer \u2192 role name
+        self._roles: dict[torch.optim.Optimizer, str] = {}
+        for role, attr in [("conformal", "_conformal"),
+                           ("gamuon", "_gamuon"),
+                           ("sgd", "_sgd")]:
+            sub = getattr(optimizer, attr, None)
+            if sub is not None:
+                self._roles[sub] = role
+
+        # History: {role: {metric: [values]}}
+        self._history: dict[str, dict[str, list]] = {}
+        for role in self._roles.values():
+            self._history[role] = {
+                "step": [],
+                "total_norm": [],
+                "mean_norm": [],
+                "max_norm": [],
+                "zero_frac": [],
+            }
+
+    def capture(self, step: Optional[int] = None) -> dict[str, dict]:
+        """Record gradient norms for all sub-optimizers.
+
+        Parameters
+        ----------
+        step : int, optional
+            Current training step (included in logs and history).
+
+        Returns
+        -------
+        dict[str, dict]
+            Nested dict keyed by role (\"conformal\", \"gamuon\", \"sgd\")
+            with per-role statistics:
+
+            - ``total_norm`` \u2014 L2 norm of the concatenated gradient vector
+            - ``mean_norm`` \u2014 average per-parameter gradient norm
+            - ``max_norm`` \u2014 maximum per-parameter gradient norm
+            - ``num_params`` \u2014 number of parameters tracked
+            - ``zero_frac`` \u2014 fraction of parameters with zero / missing gradient
+        """
+        now: dict[str, dict] = {}
+
+        for sub_opt, role in self._roles.items():
+            total_sq = 0.0
+            param_norms: list[float] = []
+            zero_count = 0
+            total_count = 0
+
+            for group in sub_opt.param_groups:
+                for p in group["params"]:
+                    total_count += 1
+                    if p.grad is not None:
+                        n = p.grad.data.norm(2).item()
+                        param_norms.append(n)
+                        total_sq += n * n
+                        if n == 0.0:
+                            zero_count += 1
+                    else:
+                        zero_count += 1
+
+            total_norm = total_sq ** 0.5
+            mean_norm = sum(param_norms) / len(param_norms) if param_norms else 0.0
+            max_norm = max(param_norms) if param_norms else 0.0
+            zero_frac = zero_count / total_count if total_count > 0 else 0.0
+
+            rec = {
+                "total_norm": total_norm,
+                "mean_norm": mean_norm,
+                "max_norm": max_norm,
+                "num_params": total_count,
+                "zero_frac": zero_frac,
+            }
+            now[role] = rec
+
+            self._history[role]["step"].append(step)
+            self._history[role]["total_norm"].append(total_norm)
+            self._history[role]["mean_norm"].append(mean_norm)
+            self._history[role]["max_norm"].append(max_norm)
+            self._history[role]["zero_frac"].append(zero_frac)
+
+        # \u2014 Live logging \u2014
+        if not self._silent and self._log_freq > 0 and now:
+            step_str = f" [step {step}]" if step is not None else ""
+            parts = []
+            for role in ("conformal", "gamuon", "sgd"):
+                if role in now:
+                    parts.append(f"{role}:{now[role]['total_norm']:.3f}")
+            # Use print so user sees the log even in a Jupyter / console setting
+            print(f"grad_norm{step_str}  {'  '.join(parts)}")
+
+        return now
+
+    def summary(self) -> dict[str, dict]:
+        """Return aggregated statistics per sub-optimizer role.
+
+        Returns
+        -------
+        dict[str, dict]
+            Keyed by role, each containing:
+
+            - ``count`` \u2014 number of recorded steps
+            - ``mean`` \u2014 mean total norm
+            - ``std`` \u2014 standard deviation of total norm
+            - ``min`` \u2014 minimum total norm
+            - ``max`` \u2014 maximum total norm
+            - ``last`` \u2014 most recent total norm
+            - ``zero_frac_mean`` \u2014 average zero-gradient fraction
+        """
+        result: dict[str, dict] = {}
+        for role, hist in self._history.items():
+            norms = hist["total_norm"]
+            n = len(norms)
+            if n == 0:
+                result[role] = {
+                    "count": 0, "mean": 0.0, "std": 0.0,
+                    "min": 0.0, "max": 0.0, "last": 0.0, "zero_frac_mean": 0.0,
+                }
+            else:
+                mean = sum(norms) / n
+                variance = sum((x - mean) ** 2 for x in norms) / n if n > 1 else 0.0
+                result[role] = {
+                    "count": n,
+                    "mean": mean,
+                    "std": variance ** 0.5,
+                    "min": min(norms),
+                    "max": max(norms),
+                    "last": norms[-1],
+                    "zero_frac_mean": sum(hist["zero_frac"]) / n,
+                }
+        return result
+
+    def plot(self, show: bool = True, save_path: Optional[str] = None) -> None:
+        """Plot gradient norm trajectories per sub-optimizer role.
+
+        Requires ``matplotlib``.  If not installed, prints a warning.
+
+        Parameters
+        ----------
+        show : bool, default True
+            Whether to display the plot interactively.
+        save_path : str, optional
+            If provided, saves the figure to this path.
+        """
+        try:
+            import matplotlib.pyplot as plt  # type: ignore[import-untyped]
+        except ImportError:
+            print("matplotlib not installed \u2014 skipping plot")
+            return
+
+        fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+
+        for role, hist in self._history.items():
+            steps = hist["step"]
+            if not steps:
+                continue
+            x = [s if s is not None else i for i, s in enumerate(steps)]
+            axes[0].plot(x, hist["total_norm"], label=role,
+                         marker=".", markersize=3, linewidth=1)
+            axes[1].plot(x, hist["mean_norm"], label=role,
+                         marker=".", markersize=3, linewidth=1)
+
+        axes[0].set_ylabel("Total gradient norm")
+        axes[0].legend()
+        axes[0].grid(True, alpha=0.3)
+
+        axes[1].set_xlabel("Step")
+        axes[1].set_ylabel("Mean gradient norm")
+        axes[1].legend()
+        axes[1].grid(True, alpha=0.3)
+
+        fig.tight_layout()
+        if save_path:
+            fig.savefig(save_path, dpi=150)
+        if show:
+            plt.show()
+        plt.close(fig)
+
+    def reset(self) -> None:
+        """Clear all accumulated history."""
+        for role, hist in self._history.items():
+            hist["step"].clear()
+            hist["total_norm"].clear()
+            hist["mean_norm"].clear()
+            hist["max_norm"].clear()
+            hist["zero_frac"].clear()
