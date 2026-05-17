@@ -870,13 +870,27 @@ Require: State (step t, momentum buffers)
 
 In practice, the optimizer needs to discover which parameters form conformal
 $(\gamma, \beta)$ pairs. The :func:`find_conformal_pairs` utility scans all
-submodules of a model and returns pairs for every normalization layer:
+submodules of a model and returns pairs for every normalization layer,
+including parameter-free norm types such as RMSNorm and weight-normalized
+modules:
 
 ```python
-def find_conformal_pairs(model, types=None):
-    """Returns list of (weight, bias) tuples for norm layers."""
+def find_conformal_pairs(
+    model,
+    types=None,
+    detect_weightnorm=True,
+):
+    """Returns list of (weight, bias) tuples for norm layers.
+
+    Also detects weight-normalized modules (weight_g parameters)
+    created by torch.nn.utils.weight_norm.
+    """
     if types is None:
-        types = (nn.LayerNorm, nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)
+        types = (
+            nn.LayerNorm,
+            nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d,
+            nn.RMSNorm,
+        )
     pairs = []
     for module in model.modules():
         if isinstance(module, types):
@@ -884,11 +898,46 @@ def find_conformal_pairs(model, types=None):
             b = getattr(module, "bias", None)
             if w is not None:
                 pairs.append((w, b) if b is not None else (w, None))
+        # Detect weight_norm parametrizations
+        if detect_weightnorm:
+            weight_g = getattr(module, "weight_g", None)
+            if weight_g is not None and isinstance(weight_g, nn.Parameter):
+                is_1d_scale = sum(1 for s in weight_g.shape if s > 1) == 1
+                if is_1d_scale:
+                    if not isinstance(module, types if types is not None else ()):
+                        pairs.append((weight_g, None))
     return pairs
 ```
 
+**Detection scope.** The function now supports three families of normalization
+parameters:
+
+| Family | Modules detected | Bias | Shape |
+|---|---|---|---|
+| **Standard norm layers** | ``LayerNorm``, ``BatchNorm1d/2d/3d`` | Optional (`nn.Parameter` or ``None``) | 1‑D |
+| **RMS-only norms** | ``RMSNorm`` | Always ``None`` (no bias) | 1‑D |
+| **Weight-normalized** | Any module with ``torch.nn.utils.weight_norm`` applied | Always ``None`` (no bias) | Effectively 1‑D (any dimensionality with one non‑singleton axis) |
+
 Detection cascades through all submodules and works for any layer with
 $\gamma$ (weight) and optional $\beta$ (bias) 1-D parameters.
+
+**RMSNorm.** Added in PyTorch 2.11, RMSNorm has a learnable ``weight``
+parameter (the $\gamma$ scale) but **no bias**. It is paired as
+``(weight, None)`` — the optimizer applies the multiplicative dilation update
+without an affine translation component.
+
+**Weight normalization.** Modules wrapped with
+:func:`torch.nn.utils.weight_norm` acquire a 1‑D ``weight_g`` parameter
+representing the per-output scale. This parameter is geometrically identical
+to a normalization $\gamma$ and is paired as ``(weight_g, None)``. The
+function accepts a ``detect_weightnorm=False`` flag to disable this scan when
+only standard norm layers are desired.
+
+The shape check ``sum(1 for s in weight_g.shape if s > 1) == 1`` accepts any
+"effectively 1‑D" parameter regardless of dimensionality — Linear layers produce
+``(out_features, 1)`` column vectors, while Conv2d produces
+``(out_channels, 1, 1, 1)`` 4‑D tensors — both are correctly identified as
+conformal scale parameters.
 
 #### 6.5.7 Parameter Group Configuration
 
