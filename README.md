@@ -151,7 +151,7 @@ Different neural network layers naturally inhabit different Clifford algebras:
 | Architecture | Relevant Algebra | Notes |
 |---|---|---|
 | Dense/MLP | $\mathrm{Cl}(m, n)$ | Weight matrix $W \in \mathbb{R}^{m \times n}$ as bivector |
-| Convolutional | $\mathrm{Cl}(c_{\text{out}}, c_{\text{in}}) \otimes \mathrm{Cl}(k_h, k_w)$ | Channel × spatial split; current Gamuon pads to square |
+| Convolutional | $\mathrm{Cl}(c_{\text{out}}, c_{\text{in}}) \otimes \mathrm{Cl}(k_h, k_w)$ | Channel × spatial split; conv 4-D weights are routed to SGD by `GamuonAuto` |
 | Attention (Q, K) | $\mathrm{Cl}(d, d)$ (split signature) | Query/key duality; per-matrix Gamuon applicable |
 | **LayerNorm** ($\gamma, \beta$) | $\mathrm{Cl}(4,1)$ (Conformal GA) | $\gamma$ = dilation versor, $\beta$ = translation versor in CGA |
 | BatchNorm | $\mathrm{Cl}(4,1)$ (Conformal GA) | Same conformal structure as LayerNorm |
@@ -337,10 +337,15 @@ This is useful when you want to encourage or discourage specific geometric modes
 
 ### Non-Square Matrices
 
-Gamuon automatically pads non-square matrices to square, applies the update, and slices back:
+Non-square `(m, n)` weights use a Stiefel-manifold-style two-sided
+rotor: left bivector `B_m = (g·Wᵀ − W·gᵀ)/2 ∈ so(m)` and right
+bivector `B_n = (Wᵀ·g − gᵀ·W)/2 ∈ so(n)` are derived from the
+gradient and current weight, and the update is
+`W ← exp(η·B_m) · W · exp(−η·B_n) − η·N` where `N` is the
+first-order residual.  No padding or shape munging — see the
+"Per-step update (non-square)" section below for the full recipe.
 
 ```python
-# (6, 4) matrix → padded to (6, 6), updated, sliced back to (6, 4)
 W = torch.nn.Parameter(torch.randn(6, 4))
 opt = Gamuon([W], lr=0.01)  # Works automatically
 ```
@@ -514,23 +519,37 @@ The geometric algebra-native optimizer. Full per-grade momentum with rotor-based
 | `betas` | `(0.9, 0.999)` | Momentum decay rates $(β₁, β₂)$ |
 | `eps` | `1e-8` | Numerical stability term |
 | `weight_decay` | `0.0` | L2 weight decay (scalar-grade dilation) |
-| `lr_scalar` | `1.0` | Learning rate multiplier for scalar grade |
+| `lr_scalar` | `1.0` | Learning rate multiplier for scalar grade (square weights only) |
 | `lr_bivector` | `1.0` | Learning rate multiplier for bivector grade |
-| `lr_strain` | `1.0` | Learning rate multiplier for strain grade |
-| `foreach` | `True` | Fuse parameter updates for efficiency |
+| `lr_strain` | `1.0` | Learning rate multiplier for strain grade / residual |
 
-**Per-step update:**
+**Per-step update (square `n × n` weight):**
 
-1. Pad non-square gradients to square matrices.
-2. Apply weight decay as `g ← g + wd · W`.
-3. Decompose gradient into `(scalar, bivector, strain)`.
-4. Update multivector momentum (grade-aware EMA).
-5. Bias-correct moments.
-6. Compute scalar step (isotropic dilation).
-7. Compute bivector step and generate rotor `R = exp(η · B̂)`.
-8. Compute strain step (symmetric deformation).
-9. Apply: `W ← R · W · Rᵀ - strain_update - scalar_update`.
-10. Unpad and write back.
+1. Apply weight decay as `g ← g + wd · W`.
+2. Decompose gradient into `(scalar, bivector, strain)`.
+3. Update multivector momentum (grade-aware EMA).
+4. Bias-correct moments.
+5. Compute scalar step (isotropic dilation).
+6. Compute bivector step and generate rotor `R = exp(η · B̂)`.
+7. Compute strain step (symmetric deformation).
+8. Apply: `W ← R · W · Rᵀ - strain_update - scalar_update`.
+
+**Per-step update (non-square `m × n` weight, m ≠ n):**
+
+Uses a Stiefel-manifold-style two-sided rotor instead of the conjugation
+sandwich (which is only grade-preserving for square `W`). With
+`g` the Adam-normalized gradient:
+
+1. `B_m = (g·Wᵀ − W·gᵀ) / 2  ∈ so(m)` — left bivector.
+2. `B_n = (Wᵀ·g − gᵀ·W) / 2  ∈ so(n)` — right bivector.
+3. `R_m = exp(lr·lr_bivector · B_m)`, `R_n = exp(−lr·lr_bivector · B_n)`.
+4. Residual `N = g + (B_m·W − W·B_n)` (the first-order remainder so
+   the total step matches `W ← W − lr·g` to `O(η)`).
+5. Apply: `W ← R_m · W · R_n − lr·lr_strain · N`.
+
+The Adam-style first/second moments are maintained on `g` itself.
+`lr_scalar` is ignored in this branch (no isotropic-dilation grade for
+rectangular `W`).
 
 ---
 

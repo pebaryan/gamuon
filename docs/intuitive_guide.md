@@ -445,13 +445,6 @@ If you *do* want to understand the math:
 - **[README.md](../README.md#documentation)** — Quick overview with some equations; the [Documentation](../README.md#documentation) section indexes all three doc files by level of depth
 - The `gamuon.py` source — Well-commented with docstrings
 
-### Performance tip: `foreach`
-
-Gamuon has a `foreach=True` parameter (on by default) that fuses operations
-across all parameters for better GPU utilization. You usually don't need to
-think about this, but if you're debugging, you can set `foreach=False` to
-process parameters one at a time (slower but easier to debug).
-
 ---
 
 If you want to see benchmarks:

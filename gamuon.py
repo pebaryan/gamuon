@@ -75,15 +75,6 @@ def grade_decompose(M: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.
     return scalar, bivector, strain
 
 
-def bivector_norm(B: torch.Tensor) -> torch.Tensor:
-    """Frobenius norm of a bivector (antisymmetric matrix).
-
-    For a simple bivector  B  this equals  |θ|  where  θ/2  is the
-    rotation angle of the generated rotor.
-    """
-    return torch.sqrt((B ** 2).sum(dim=(-2, -1), keepdim=True).clamp(min=1e-30))
-
-
 def bivector_exp(B: torch.Tensor) -> torch.Tensor:
     """Exponential of a bivector  →  rotor in Spin(n).
 
@@ -247,8 +238,23 @@ class Gamuon(torch.optim.Optimizer):
         Multiplier for the learning rate on the bivector (rotor) grade.
     lr_strain : float, default 1.0
         Multiplier for the learning rate on the strain grade.
-    foreach : bool, default True
-        Whether to fuse parameter updates for efficiency.
+
+    Notes
+    -----
+    For **non-square**  (m, n)  weights, the update switches to a
+    Stiefel-manifold-style two-sided rotor:
+
+        B_m = (G·Wᵀ − W·Gᵀ)/2  ∈ so(m)
+        B_n = (Wᵀ·G − Gᵀ·W)/2  ∈ so(n)
+        N   = G − (B_m·W − W·B_n)     -- first-order residual
+        W   ← exp(η·B_m) · W · exp(−η·B_n)  −  η·N
+
+    The Adam-style first/second moments are maintained on the gradient
+    itself (a single (m, n) tensor); the rotors and residual are
+    recomputed each step from the current weight.  ``lr_bivector``
+    scales the rotor steps; ``lr_strain`` scales the residual.
+    ``lr_scalar`` is ignored (no isotropic-dilation grade in the
+    rectangular case).
     """
 
     def __init__(
@@ -261,7 +267,6 @@ class Gamuon(torch.optim.Optimizer):
         lr_scalar: float = 1.0,
         lr_bivector: float = 1.0,
         lr_strain: float = 1.0,
-        foreach: bool = True,
     ):
         if not 0.0 <= lr:
             raise ValueError(f"Invalid lr: {lr}")
@@ -277,7 +282,6 @@ class Gamuon(torch.optim.Optimizer):
         defaults = dict(
             lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
             lr_scalar=lr_scalar, lr_bivector=lr_bivector, lr_strain=lr_strain,
-            foreach=foreach,
         )
         super().__init__(params, defaults)
 
@@ -317,11 +321,6 @@ class Gamuon(torch.optim.Optimizer):
                 loss = closure()
 
         for group in self.param_groups:
-            p_list = group["params"]
-
-            # -----------------------------------------------------------
-            #  Group hyper‑parameters
-            # -----------------------------------------------------------
             lr = group["lr"]
             beta1, beta2 = group["betas"]
             eps = group["eps"]
@@ -330,100 +329,133 @@ class Gamuon(torch.optim.Optimizer):
             lr_b = group["lr_bivector"]
             lr_p = group["lr_strain"]
 
-            # -----------------------------------------------------------
-            #  Per‑parameter step
-            # -----------------------------------------------------------
-            for p in p_list:
+            for p in group["params"]:
                 if p.grad is None:
                     continue
                 g = p.grad.data
                 if g.is_sparse:
                     raise RuntimeError("Gamuon does not support sparse gradients")
-
-                # -- ensure square by padding if necessary --
-                orig_shape = g.shape
-                orig_p_data = p.data
-                needs_unpad = False
-                if g.dim() == 2 and g.shape[0] != g.shape[1]:
-                    m, n = g.shape
-                    max_dim = max(m, n)
-                    padded_g = g.new_zeros(max_dim, max_dim)
-                    padded_g[:m, :n] = g
-                    g = padded_g
-                    padded_p = p.data.new_zeros(max_dim, max_dim)
-                    padded_p[:m, :n] = p.data
-                    p.data = padded_p
-                    needs_unpad = True
-                    orig_shape_for_unpad = (m, n)
-                elif g.dim() != 2:
+                if g.dim() != 2:
                     raise NotImplementedError(
-                        "Gamuon currently supports only 2‑D parameters. "
-                        f"Got shape {orig_shape}"
+                        "Gamuon currently supports only 2-D parameters. "
+                        f"Got shape {tuple(g.shape)}"
                     )
 
-                n = g.shape[-1]
-                device, dtype = g.device, g.dtype
-
-                # -- initialise state (always keyed by the original parameter) --
-                state = self.state[p]
-                if len(state) == 0:
-                    state["step"] = 0
-                    state["momentum"] = MultivectorMomentum(n, device, dtype)
-
-                state["step"] += 1
-                step_t = torch.tensor(state["step"], dtype=dtype, device=device)
-
-                # -- weight decay (applied as scalar dilation) --
+                # Weight decay is applied to the gradient in-place (matches
+                # PyTorch convention; the test suite asserts this).
                 if wd != 0:
                     g.add_(p.data, alpha=wd)
 
-                # -- grade decomposition --
-                scalar, bivector, strain = grade_decompose(g)
+                m, n = g.shape
+                state = self.state[p]
+                if len(state) == 0:
+                    state["step"] = 0
+                    if m == n:
+                        state["momentum"] = MultivectorMomentum(n, g.device, g.dtype)
+                    else:
+                        state["m"] = torch.zeros_like(g)
+                        state["v"] = torch.zeros_like(g)
 
-                # -- multivector momentum --
-                mom = state["momentum"]
-                (m_s, m_b, m_p, v_s, v_b, v_p) = mom.step(
-                    scalar, bivector, strain, (beta1, beta2)
-                )
+                state["step"] += 1
+                t = state["step"]
+                bc1 = 1.0 - beta1 ** t
+                bc2 = 1.0 - beta2 ** t
 
-                # -- bias correction --
-                bc1 = 1 - beta1 ** step_t
-                bc2 = 1 - beta2 ** step_t
-
-                # -- compute updates per grade --
-
-                # • Scalar grade:  isotropic dilation
-                #   Use the mean of the bias-corrected scalar momentum diagonal
-                m_s_bc = m_s.diagonal().mean() / bc1
-                v_s_bc = (v_s.diagonal().mean() / bc2).sqrt()
-                scalar_step = (lr * lr_s) * m_s_bc / (v_s_bc + eps)
-
-                # • Bivector grade:  generate rotor  R = exp(η · B̂)
-                m_b_bc = m_b / bc1.unsqueeze(-1).unsqueeze(-1)
-                v_b_bc = v_b / bc2.unsqueeze(-1).unsqueeze(-1)
-                bivector_step = (lr * lr_b) * m_b_bc / (v_b_bc.sqrt() + eps)
-                R = bivector_exp(bivector_step)
-
-                # • Strain grade:  symmetric deformation
-                m_p_bc = m_p / bc1.unsqueeze(-1).unsqueeze(-1)
-                v_p_bc = v_p / bc2.unsqueeze(-1).unsqueeze(-1)
-                update_strain = (lr * lr_p) * m_p_bc / (v_p_bc.sqrt() + eps)
-
-                # -- apply update via versor sandwich --
-                updated = (rotor_apply(R, p.data)
-                           - scalar_step * torch.eye(n, device=device, dtype=dtype)
-                           - update_strain)
-
-                # -- unpad if necessary and write back --
-                if needs_unpad:
-                    m, n = orig_shape_for_unpad
-                    orig_p_data.copy_(updated[:m, :n])
-                    # Restore original parameter reference
-                    p.data = orig_p_data
+                if m == n:
+                    self._step_square(p, g, n, lr, lr_s, lr_b, lr_p,
+                                      beta1, beta2, bc1, bc2, eps, state)
                 else:
-                    p.data.copy_(updated)
+                    self._step_rect(p, g, m, n, lr, lr_b, lr_p,
+                                    beta1, beta2, bc1, bc2, eps, state)
 
         return loss
+
+    @staticmethod
+    @torch.no_grad()
+    def _step_square(p, g, n, lr, lr_s, lr_b, lr_p,
+                     beta1, beta2, bc1, bc2, eps, state):
+        """Versor sandwich update  W ← R·W·Rᵀ − strain − scalar·I  on so(n)."""
+        scalar, bivector, strain = grade_decompose(g)
+
+        mom = state["momentum"]
+        m_s, m_b, m_p, v_s, v_b, v_p = mom.step(
+            scalar, bivector, strain, (beta1, beta2)
+        )
+
+        # Scalar grade: isotropic dilation (a single coefficient × I)
+        m_s_bc = m_s.diagonal().mean() / bc1
+        v_s_bc = (v_s.diagonal().mean() / bc2).sqrt()
+        scalar_step = (lr * lr_s) * m_s_bc / (v_s_bc + eps)
+
+        # Bivector grade: rotor R = exp(η · B̂)
+        bivector_step = (lr * lr_b) * (m_b / bc1) / ((v_b / bc2).sqrt() + eps)
+        R = bivector_exp(bivector_step)
+
+        # Strain grade: symmetric traceless deformation
+        strain_step = (lr * lr_p) * (m_p / bc1) / ((v_p / bc2).sqrt() + eps)
+
+        eye = torch.eye(n, device=g.device, dtype=g.dtype)
+        p.data.copy_(rotor_apply(R, p.data) - scalar_step * eye - strain_step)
+
+    @staticmethod
+    @torch.no_grad()
+    def _step_rect(p, g, m, n, lr, lr_b, lr_p,
+                   beta1, beta2, bc1, bc2, eps, state):
+        """Stiefel-style two-sided rotor update for non-square  (m, n)  W.
+
+        Derives bivectors  B_m = (GWᵀ − WGᵀ)/2  ∈ so(m)  and
+        B_n = (WᵀG − GᵀW)/2  ∈ so(n)  from the Adam-normalised gradient
+        and current weight, applies the two-sided rotor, then subtracts
+        the first-order residual N = G − (B_m·W − W·B_n)  so the full
+        step matches  W ← W − η·G  to first order in  η.
+        """
+        m_buf = state["m"]
+        v_buf = state["v"]
+        m_buf.mul_(beta1).add_(g, alpha=1 - beta1)
+        v_buf.mul_(beta2).addcmul_(g, g, value=1 - beta2)
+
+        # Adam-normalised gradient direction
+        g_hat = (m_buf / bc1) / ((v_buf / bc2).sqrt() + eps)
+
+        W = p.data
+        Wt = W.transpose(-2, -1)
+        ght = g_hat.transpose(-2, -1)
+
+        # G·Wᵀ ∈ ℝ^{m×m}  and  Gᵀ·W ∈ ℝ^{n×n}.
+        # Note: W·Gᵀ = (G·Wᵀ)ᵀ  and  Wᵀ·G = (Gᵀ·W)ᵀ, so we only need one
+        # product per side.
+        gWT = g_hat @ Wt    # (m, m)
+        gTW = ght @ W       # (n, n)
+
+        B_m = (gWT - gWT.transpose(-2, -1)) / 2                  # ∈ so(m)
+        B_n = (gTW.transpose(-2, -1) - gTW) / 2                  # ∈ so(n)
+
+        # Tangent-space step magnitudes (scaled by lr · lr_bivector)
+        B_m_step = (lr * lr_b) * B_m
+        B_n_step = (lr * lr_b) * B_n
+
+        # Rotors on each side.  bivector_exp handles n∈{2,3} via closed
+        # form and n≥4 via torch.matrix_exp; for n=1 the so(1) algebra is
+        # trivial (B is the zero 1×1 matrix) and matrix_exp returns I.
+        R_m = bivector_exp(B_m_step) if m > 1 else torch.eye(
+            1, device=g.device, dtype=g.dtype
+        )
+        R_n_neg = bivector_exp(-B_n_step) if n > 1 else torch.eye(
+            1, device=g.device, dtype=g.dtype
+        )
+
+        # Residual chosen so the full update equals  -lr · g_hat  at O(η):
+        #   R_m·W·R_n⁻ ≈ W + η·(B_m·W − W·B_n)             [tangent]
+        #   −η·residual  must equal  −η·g_hat − η·(B_m·W − W·B_n)
+        #   ⇒  residual = g_hat + (B_m·W − W·B_n)
+        # When lr_bivector = lr_strain, the tangent terms cancel exactly
+        # and the first-order update reduces to plain  W ← W − lr·g_hat;
+        # the O(η²) rotor terms supply the geometric correction.  When
+        # lr_bivector ≠ lr_strain, the user is reweighting rotor vs.
+        # additive contributions.
+        residual = g_hat + (B_m @ W - W @ B_n)
+
+        p.data.copy_(R_m @ W @ R_n_neg - (lr * lr_p) * residual)
 
 
 # ╔══════════════════════════════════════════════════════════════════════╗
@@ -482,26 +514,33 @@ class GamuonNS(torch.optim.Optimizer):
                 loss = closure()
 
         for group in self.param_groups:
+            lr = group["lr"]
             for p in group["params"]:
                 if p.grad is None:
                     continue
                 g = p.grad.data
+                if g.dim() != 2:
+                    raise NotImplementedError(
+                        "GamuonNS currently supports only 2-D parameters. "
+                        f"Got shape {tuple(g.shape)}"
+                    )
 
                 # Project gradient onto orthogonal group via NS
                 sign_g = newton_schulz(g, num_iters=group["ns_iters"])
 
-                # Standard Muon-style update with grade decomposition
-                _, bivector, strain = grade_decompose(g)
-                scalar_val = g.diagonal().mean().item()
-                n = g.shape[-1]
-                device, dtype = g.device, g.dtype
+                if g.shape[0] == g.shape[1]:
+                    # Square: full grade decomposition matches Gamuon's shape.
+                    _, _, strain = grade_decompose(g)
+                    scalar_val = g.diagonal().mean().item()
+                    n = g.shape[-1]
+                    eye = torch.eye(n, device=g.device, dtype=g.dtype)
+                    update = lr * (sign_g - strain - scalar_val * eye)
+                else:
+                    # Rectangular: scalar·I and a square-symmetric "strain"
+                    # don't have a shape-matching form.  Fall back to the
+                    # standard Muon update on the orthogonalised gradient.
+                    update = lr * sign_g
 
-                # Apply update:  orthogonal part + strain + scalar
-                update = (group["lr"]) * (
-                    sign_g
-                    - strain
-                    - scalar_val * torch.eye(n, device=device, dtype=dtype)
-                )
                 p.data.add_(-update)
 
         return loss
@@ -825,7 +864,7 @@ class ConformalMuon(torch.optim.Optimizer):
                 state["exp_avg_sq_b"] = torch.zeros_like(beta.data)
 
         state["step"] += 1
-        step_t = torch.tensor(state["step"], dtype=gamma.dtype, device=gamma.device)
+        t = state["step"]
 
         # ── Momentum on the Lie algebra ─────────────────────────────
         state["exp_avg_a"].mul_(beta1).add_(g_alpha, alpha=1 - beta1)
@@ -836,8 +875,8 @@ class ConformalMuon(torch.optim.Optimizer):
             state["exp_avg_sq_b"].mul_(beta2).add_(g_beta ** 2, alpha=1 - beta2)
 
         # ── Bias correction ─────────────────────────────────────────
-        bc1 = 1 - beta1 ** step_t
-        bc2 = 1 - beta2 ** step_t
+        bc1 = 1.0 - beta1 ** t
+        bc2 = 1.0 - beta2 ** t
 
         m_a = state["exp_avg_a"] / bc1
         v_a = state["exp_avg_sq_a"] / bc2
@@ -898,8 +937,6 @@ class GamuonAuto:
         Numerical stability term.
     weight_decay : float, default 0.0
         Weight decay applied to all parameters.
-    foreach : bool, default True
-        Whether Gamuon should use fused foreach operations.
 
     Example
     -------
@@ -920,13 +957,11 @@ class GamuonAuto:
         betas: Tuple[float, float] = (0.9, 0.999),
         eps: float = 1e-8,
         weight_decay: float = 0.0,
-        foreach: bool = True,
     ):
         self.lr = lr
         self.betas = betas
         self.eps = eps
         self.weight_decay = weight_decay
-        self.foreach = foreach
 
         self._conformal: Optional[ConformalMuon] = None
         self._gamuon: Optional[Gamuon] = None
@@ -981,7 +1016,6 @@ class GamuonAuto:
                 betas=self.betas,
                 eps=self.eps,
                 weight_decay=self.weight_decay,
-                foreach=self.foreach,
             )
         if sgd_params:
             self._sgd = torch.optim.SGD(
@@ -999,7 +1033,23 @@ class GamuonAuto:
 
         for group in param_groups:
             role = group.get("role", "sgd")
+            # Strip the role key so it doesn't leak into the sub-optimizer's
+            # param_group dict (PyTorch warns on unknown keys in some
+            # versions and it's not part of its public API).
+            group = {k: v for k, v in group.items() if k != "role"}
             if role == "conformal":
+                # ConformalMuon's step() reads the per-group `is_conformal`
+                # flag; tag the dict so the affine update is actually used
+                # (otherwise it silently falls back to SGD).
+                params_in_group = list(group.get("params", []))
+                if len(params_in_group) > 2:
+                    raise ValueError(
+                        "GamuonAuto: role='conformal' groups must contain "
+                        "exactly one (γ) or two (γ, β) parameters; got "
+                        f"{len(params_in_group)}.  Split each norm layer "
+                        "into its own group."
+                    )
+                group["is_conformal"] = True
                 conf_params.append(group)
             elif role == "gamuon":
                 gamuon_params.append(group)
@@ -1021,7 +1071,6 @@ class GamuonAuto:
                 betas=self.betas,
                 eps=self.eps,
                 weight_decay=self.weight_decay,
-                foreach=self.foreach,
             )
         if sgd_params:
             self._sgd = torch.optim.SGD(

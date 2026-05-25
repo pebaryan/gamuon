@@ -451,6 +451,22 @@ class TestGamuonNS:
         # Just check it ran (NS can produce NaN but shouldn't crash python)
         assert True
 
+    def test_ns_rectangular_does_not_crash(self):
+        """GamuonNS used to crash on non-square gradients due to a
+        scalar·I subtraction with mismatched shape.  Should now just
+        apply sign(G) additively for rectangular weights."""
+        torch.manual_seed(0)
+        w = torch.nn.Parameter(torch.randn(6, 4))
+        opt = GamuonNS([w], lr=0.01, ns_iters=5)
+
+        before = w.data.clone()
+        (w ** 2).mean().backward()
+        opt.step()
+
+        assert torch.isfinite(w.data).all(), "GamuonNS produced non-finite values"
+        # Should actually move the weights
+        assert (w.data - before).norm() > 0
+
 
 # ╔══════════════════════════════════════════════════════════════════════╗
 # ║  EDGE CASES                                                        ║
@@ -1003,6 +1019,72 @@ class TestGamuonAuto:
         assert opt._gamuon is None
         assert opt._sgd is None
         assert len(opt._optimizers) == 0
+
+    def test_auto_manual_groups_role_conformal_uses_affine_update(self):
+        """role='conformal' groups in the manual-group path used to
+        silently fall back to plain SGD because the is_conformal flag
+        wasn't being injected.  Verify the affine update is actually
+        applied: gamma must update *multiplicatively* (γ ← γ · e^a),
+        which is the signature behaviour of ConformalMuon."""
+        torch.manual_seed(0)
+        ln = torch.nn.LayerNorm(8)
+        other = torch.nn.Parameter(torch.randn(4, 4))
+
+        opt = GamuonAuto(
+            [
+                {"params": [ln.weight, ln.bias], "role": "conformal"},
+                {"params": [other], "role": "gamuon"},
+            ],
+            lr=1e-2,
+        )
+
+        # The manual-group path must build a real ConformalMuon
+        assert opt._conformal is not None, "manual group conformal missing"
+        assert opt._gamuon is not None
+        # And the group must be flagged so step() takes the affine branch
+        conf_groups = [
+            g for g in opt._conformal.param_groups
+            if g.get("is_conformal", False)
+        ]
+        assert len(conf_groups) == 1, (
+            f"Expected 1 affine-flagged group, got {len(conf_groups)}"
+        )
+
+        # Run a step; the affine update is multiplicative on gamma,
+        # so γ_new / γ_old should be uniform across all entries (a
+        # single dilation factor) — additive SGD would not have this
+        # property because the per-entry grads differ.
+        gamma_before = ln.weight.data.clone()
+        x = torch.randn(4, 8)
+        loss = (ln(x) ** 2).sum() + (other ** 2).sum()
+        loss.backward()
+        opt.step()
+
+        ratios = ln.weight.data / gamma_before
+        # All gamma entries should have moved by the same multiplicative
+        # factor (within float32 noise) since the dilation coefficient
+        # `a` is shared across entries for a single norm layer.
+        assert ratios.std().item() < 1e-5, (
+            f"gamma did not update as a uniform dilation "
+            f"(std of ratio = {ratios.std().item():.2e}) — "
+            "the manual-group conformal path is falling back to SGD."
+        )
+
+    def test_auto_manual_groups_conformal_rejects_oversized_group(self):
+        """A role='conformal' group with >2 params is a user error
+        (norm layers have at most γ and β); GamuonAuto should reject
+        it instead of silently dropping the extras inside
+        ConformalMuon._step_conformal."""
+        ln1 = torch.nn.LayerNorm(4)
+        ln2 = torch.nn.LayerNorm(4)
+        with pytest.raises(ValueError, match="role='conformal'"):
+            GamuonAuto(
+                [{
+                    "params": [ln1.weight, ln1.bias, ln2.weight, ln2.bias],
+                    "role": "conformal",
+                }],
+                lr=1e-3,
+            )
 
     def test_auto_training_step(self):
         """A full training step with GamuonAuto should update all params and reduce loss."""

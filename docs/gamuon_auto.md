@@ -36,7 +36,6 @@ GamuonAuto(
     betas: Tuple[float, float] = (0.9, 0.999),
     eps: float = 1e-8,
     weight_decay: float = 0.0,
-    foreach: bool = True,
 )
 ```
 
@@ -49,7 +48,6 @@ GamuonAuto(
 | `betas` | `(float, float)` | `(0.9, 0.999)` | Coefficients for first- and second-moment estimates (Adam-style). |
 | `eps` | `float` | `1e-8` | Numerical stability term added to denominator. |
 | `weight_decay` | `float` | `0.0` | L2 weight decay. Applied as isotropic scalar dilation in `Gamuon`, Lie-algebra decay in `ConformalMuon`, standard L2 in SGD. |
-| `foreach` | `bool` | `True` | Whether `Gamuon` should fuse parameter updates for efficiency (passed through to the `Gamuon` sub-optimizer; ignored by `ConformalMuon` and SGD). |
 
 ---
 
@@ -82,12 +80,19 @@ Pass standard PyTorch param groups with a `"role"` key:
 ```python
 optimizer = GamuonAuto([
     {"params": model.layer1.parameters(), "role": "gamuon"},
-    {"params": model.norm.parameters(), "role": "conformal"},
-    {"params": model.bias_parameters(), "role": "sgd"},
+    {"params": list(model.norm.parameters()), "role": "conformal"},
+    {"params": [model.layer1.bias], "role": "sgd"},
 ], lr=1e-3)
 ```
 
 Valid roles: `"conformal"`, `"gamuon"`, `"sgd"` (default).
+
+> **Note on `role="conformal"` groups.** Each conformal group must contain
+> exactly one (`γ` only) or two (`γ`, `β`) tensors — i.e. a single norm
+> layer's parameters.  `GamuonAuto` raises `ValueError` on groups with more
+> than two parameters, because `ConformalMuon` treats `p_list[0]` as `γ`
+> and `p_list[1]` as `β` and has no way to pair up multiple norm layers
+> inside one group.  Split each norm layer into its own group.
 
 ---
 
@@ -448,7 +453,11 @@ Yes — use **manual param-group mode**:
 optimizer = GamuonAuto([
     {"params": model.encoder.parameters(), "lr": 1e-3, "role": "gamuon"},
     {"params": model.decoder.parameters(), "lr": 3e-4, "role": "gamuon"},
-    {"params": model.norms.parameters(), "lr": 1e-3, "role": "conformal"},
+    # One conformal group per norm layer (γ and optional β only):
+    {"params": [model.norm1.weight, model.norm1.bias],
+     "lr": 1e-3, "role": "conformal"},
+    {"params": [model.norm2.weight, model.norm2.bias],
+     "lr": 1e-3, "role": "conformal"},
 ])
 ```
 
