@@ -6,15 +6,20 @@ Trains a small transformer language model with each optimizer and compares
 convergence speed (loss vs steps), wall-clock time, and final loss.
 
 Usage:
-    python benchmarks/benchmark_transformer.py           # quick run (200 steps)
-    python benchmarks/benchmark_transformer.py --steps 1000   # longer run
-    python benchmarks/benchmark_transformer.py --no-plot      # no PDF output
+    python benchmarks/benchmark_transformer.py           # synthetic, 200 steps
+    python benchmarks/benchmark_transformer.py --steps 1000     # longer run
+    python benchmarks/benchmark_transformer.py --no-plot        # no PDF output
+    python benchmarks/benchmark_transformer.py --ablations      # add no-rotor / pad-square
+    python benchmarks/benchmark_transformer.py --task wikitext  # real text task
+                                                                # (wikitext-2-raw-v1
+                                                                #  + gpt2 BPE)
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -28,7 +33,8 @@ import torch.nn.functional as F
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from gamuon import (Gamuon, GamuonNS, GamuonAuto, grade_decompose,
-                       newton_schulz,
+                       newton_schulz, bivector_exp, rotor_apply,
+                       MultivectorMomentum,
                        ConformalMuon, find_conformal_pairs)
 
 
@@ -254,6 +260,103 @@ class MuonOptimizer(torch.optim.Optimizer):
         return loss
 
 
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  ABLATIONS                                                          ║
+# ║  Variants that isolate specific design choices in Gamuon.           ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+
+class GamuonPadSquare(Gamuon):
+    """Ablation: pre-fix non-square handling that pads to square.
+
+    Subclasses :class:`Gamuon` and overrides only the rectangular path
+    with the original pad-to-square algorithm (gradient and weight are
+    padded with zeros to ``max(m, n) × max(m, n)``, the square sandwich
+    update is applied, then the result is sliced back).  This is
+    mathematically incorrect (the rotor mixes the padded zero rows /
+    columns into the original block, so the spectrum-preservation
+    invariant doesn't hold for the (m, n) slice) — it exists here only
+    to compare against the Stiefel-style two-sided update that
+    replaced it.
+
+    The square path is inherited unchanged from ``Gamuon``.
+    """
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group["lr"]
+            beta1, beta2 = group["betas"]
+            eps = group["eps"]
+            wd = group["weight_decay"]
+            lr_s = group["lr_scalar"]
+            lr_b = group["lr_bivector"]
+            lr_p = group["lr_strain"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                g = p.grad.data
+                if g.dim() != 2:
+                    raise NotImplementedError(
+                        f"GamuonPadSquare: only 2-D params (got {tuple(g.shape)})"
+                    )
+                if wd != 0:
+                    g.add_(p.data, alpha=wd)
+
+                m, n = g.shape
+                if m == n:
+                    # Square: delegate to inherited square path.
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state["step"] = 0
+                        state["momentum"] = MultivectorMomentum(n, g.device, g.dtype)
+                    state["step"] += 1
+                    t = state["step"]
+                    bc1 = 1.0 - beta1 ** t
+                    bc2 = 1.0 - beta2 ** t
+                    Gamuon._step_square(
+                        p, g, n, lr, lr_s, lr_b, lr_p,
+                        beta1, beta2, bc1, bc2, eps, state,
+                    )
+                    continue
+
+                # ── Rectangular: pad to square, run the square update,
+                #    slice back.  This is the pre-fix behaviour.
+                max_dim = max(m, n)
+                padded_g = g.new_zeros(max_dim, max_dim)
+                padded_g[:m, :n] = g
+                padded_p = p.data.new_zeros(max_dim, max_dim)
+                padded_p[:m, :n] = p.data
+
+                state = self.state[p]
+                if len(state) == 0:
+                    state["step"] = 0
+                    state["momentum"] = MultivectorMomentum(
+                        max_dim, g.device, g.dtype
+                    )
+                state["step"] += 1
+                t = state["step"]
+                bc1 = 1.0 - beta1 ** t
+                bc2 = 1.0 - beta2 ** t
+
+                # Stand in a shadow Parameter so the square path can mutate
+                # `.data` without touching the real parameter.
+                shadow = torch.nn.Parameter(padded_p, requires_grad=False)
+                Gamuon._step_square(
+                    shadow, padded_g, max_dim, lr, lr_s, lr_b, lr_p,
+                    beta1, beta2, bc1, bc2, eps, state,
+                )
+                p.data.copy_(shadow.data[:m, :n])
+
+        return loss
+
+
 class CombinedOptimizer:
     """Wraps two optimizers into one for combined step().
 
@@ -272,6 +375,17 @@ class CombinedOptimizer:
     def step(self, *args, **kwargs):
         for opt in self.optimizers:
             opt.step(*args, **kwargs)
+
+    @property
+    def param_groups(self) -> list[dict]:
+        """Flat list of every sub-optimizer's param groups, in order.
+
+        Lets a schedule iterate and mutate ``g["lr"]`` uniformly across
+        all sub-optimizers (Gamuon / Adam-for-embed / SGD-for-biases /
+        ConformalMuon).  Each entry is a live dict that the underlying
+        optimizer reads from on each ``step()`` call.
+        """
+        return [g for opt in self.optimizers for g in opt.param_groups]
 
 
 # ╔══════════════════════════════════════════════════════════════════════╗
@@ -293,6 +407,158 @@ def generate_batch(
     return x, y
 
 
+def load_wikitext_tokens(split: str = "train") -> tuple[torch.Tensor, int]:
+    """Tokenize a wikitext-2-raw-v1 split with the gpt2 BPE tokenizer.
+
+    Returns the concatenated token stream as a 1-D long tensor and the
+    tokenizer's vocab size.  Both the dataset and the tokenizer are
+    expected to already live in the local HF cache.
+    """
+    from datasets import load_dataset
+    from transformers import GPT2TokenizerFast
+
+    ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split=split)
+    tok = GPT2TokenizerFast.from_pretrained("gpt2")
+    # datasets 4.x returns a Column object for ds["text"]; the fast
+    # tokenizer requires a plain list[str].
+    texts = list(ds["text"])
+    encs = tok(texts, add_special_tokens=False)["input_ids"]
+    ids: list[int] = []
+    for row in encs:
+        if row:
+            ids.extend(row)
+    return torch.tensor(ids, dtype=torch.long), tok.vocab_size
+
+
+def make_wikitext_batch_fn(
+    tokens: torch.Tensor,
+    batch_size: int,
+    seq_len: int,
+    device: torch.device,
+):
+    """Return a closure that draws random  (x, y)  windows from ``tokens``.
+
+    ``x``  is a  ``(batch_size, seq_len)``  block of token IDs and  ``y``
+    is the next-token target (shifted by one), both on ``device``.
+    """
+    n = tokens.numel() - seq_len - 1
+    if n <= 0:
+        raise ValueError(
+            f"Wikitext stream too short ({tokens.numel()} tokens) for "
+            f"seq_len={seq_len}"
+        )
+    tokens_dev = tokens.to(device)
+
+    def batch_fn() -> tuple[torch.Tensor, torch.Tensor]:
+        starts = torch.randint(0, n, (batch_size,), device=device)
+        idx = starts.unsqueeze(1) + torch.arange(seq_len + 1, device=device)
+        block = tokens_dev[idx]                # (B, seq_len+1)
+        x = block[:, :-1].contiguous()
+        y = block[:, 1:].contiguous()
+        return x, y
+
+    return batch_fn
+
+
+def load_wikitext_val_batches(
+    seq_len: int,
+    batch_size: int,
+    num_batches: int,
+    device: torch.device,
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """Pre-build a fixed set of  (x, y)  validation batches from
+    wikitext-2-raw-v1 's validation split.
+
+    Windows are placed at evenly-spaced offsets across the val stream so
+    every call with the same arguments produces the same batches —
+    important for ``val_history`` to be comparable across captures.
+    """
+    tokens, _ = load_wikitext_tokens(split="validation")
+    n = tokens.numel() - seq_len - 1
+    if n <= 0:
+        raise ValueError(
+            f"Wikitext validation stream too short ({tokens.numel()} tokens) "
+            f"for seq_len={seq_len}"
+        )
+    tokens_dev = tokens.to(device)
+    total_windows = num_batches * batch_size
+    # Evenly spaced deterministic starts
+    starts = torch.linspace(0, n - 1, total_windows, device=device).long()
+    base = torch.arange(seq_len + 1, device=device)
+    batches: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for b in range(num_batches):
+        b_starts = starts[b * batch_size : (b + 1) * batch_size]
+        idx = b_starts.unsqueeze(1) + base
+        block = tokens_dev[idx]                # (B, seq_len+1)
+        x = block[:, :-1].contiguous()
+        y = block[:, 1:].contiguous()
+        batches.append((x, y))
+    return batches
+
+
+def cosine_lr_factor(
+    step: int,
+    total: int,
+    warmup_frac: float = 0.0,
+    min_ratio: float = 0.1,
+) -> float:
+    """Return a multiplier on the peak LR for cosine decay (with optional
+    linear warmup).  The multiplier is in [min_ratio, 1.0].
+
+    ``step``      0-indexed current step.
+    ``total``     total number of training steps.
+    ``warmup_frac`` fraction of ``total`` spent in linear warmup
+                  (multiplier rises 1/warmup_steps → 1.0).
+    ``min_ratio``  multiplier at the final step.
+    """
+    if total <= 0:
+        return 1.0
+    warmup_steps = max(0, int(round(total * warmup_frac)))
+    if warmup_steps > 0 and step < warmup_steps:
+        return (step + 1) / warmup_steps
+    decay_steps = max(1, total - warmup_steps)
+    decay_step = step - warmup_steps
+    cos = 0.5 * (1.0 + math.cos(math.pi * decay_step / decay_steps))
+    return min_ratio + (1.0 - min_ratio) * cos
+
+
+@torch.no_grad()
+def eval_val_loss(
+    model: nn.Module,
+    val_batches: list[tuple[torch.Tensor, torch.Tensor]],
+    vocab_size: int,
+    ignore_index: int = -100,
+) -> float:
+    """Mean per-token cross-entropy over a fixed set of val batches.
+
+    Switches the model to ``eval()`` for the pass and restores its
+    previous mode afterwards.  Uses ``reduction='sum'`` then divides by
+    the count of non-ignored target tokens, so partial batches at the
+    tail (if any) don't bias the average.
+    """
+    was_training = model.training
+    model.eval()
+    total_loss = 0.0
+    total_tokens = 0
+    for x, y in val_batches:
+        logits = model(x)
+        loss = F.cross_entropy(
+            logits.view(-1, vocab_size),
+            y.view(-1),
+            ignore_index=ignore_index,
+            reduction="sum",
+        )
+        if ignore_index == -100:
+            valid = y.numel()
+        else:
+            valid = int((y != ignore_index).sum().item())
+        total_loss += loss.item()
+        total_tokens += valid
+    if was_training:
+        model.train()
+    return total_loss / max(total_tokens, 1)
+
+
 def get_param_groups(model: nn.Module, lr: float) -> list[dict]:
     """Return parameter groups: 2D params + biases/1D params."""
     matrix_params = []
@@ -309,6 +575,43 @@ def get_param_groups(model: nn.Module, lr: float) -> list[dict]:
     if other_params:
         groups.append({"params": other_params, "lr": lr})
     return groups
+
+
+def split_params_for_muon(
+    model: nn.Module,
+) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
+    """Split params into  (embed_head, internal_2d, other_1d).
+
+    Muon-style optimizers (Muon, Gamuon, GamuonNS) do dense matrix
+    operations whose memory cost is quadratic in the larger weight
+    dimension.  For the gpt2 BPE (vocab=50257) the token embedding
+    and final classifier exceed the practical limit of
+    ``torch.matrix_exp`` and Newton–Schulz alike, so standard practice
+    routes those layers to Adam instead.  See Keller Jordan's Muon
+    write-up: embeddings and the output head are explicitly excluded.
+
+    The split is structural (by ``nn.Embedding`` and the ``head``
+    attribute) rather than by a magic size threshold, so it produces
+    the same routing on the synthetic-vocab task as on wikitext.
+    """
+    embed_head_ids: set[int] = set()
+    for mod in model.modules():
+        if isinstance(mod, nn.Embedding):
+            embed_head_ids.update(id(p) for p in mod.parameters())
+    if hasattr(model, "head") and isinstance(model.head, nn.Linear):
+        embed_head_ids.update(id(p) for p in model.head.parameters())
+
+    embed_head: list[torch.Tensor] = []
+    internal: list[torch.Tensor] = []
+    other: list[torch.Tensor] = []
+    for p in model.parameters():
+        if id(p) in embed_head_ids:
+            embed_head.append(p)
+        elif p.ndim == 2:
+            internal.append(p)
+        else:
+            other.append(p)
+    return embed_head, internal, other
 
 
 def _norm_layers(model: nn.Module) -> list[tuple[str, nn.Module]]:
@@ -373,18 +676,38 @@ def extract_norm_tensors(model: nn.Module) -> dict[str, dict]:
 
 def run_training(
     model: nn.Module,
-    optimizer: torch.optim.Optimizer,
+    optimizer,
     steps: int,
     vocab_size: int,
-    batch_size: int,
-    seq_len: int,
+    batch_fn,
     device: torch.device,
     label: str,
     *,
     track_norms: bool = False,
     norm_capture_interval: int = 50,
+    ignore_index: int = -100,
+    val_batches: Optional[list] = None,
+    val_capture_interval: Optional[int] = None,
+    schedule: Optional[str] = None,
+    warmup_frac: float = 0.0,
+    min_lr_ratio: float = 0.1,
 ) -> dict:
     """Run training and return loss history + timing data.
+
+    ``batch_fn``  is a zero-argument callable returning  ``(x, y)``  on
+    the target device.  The synthetic and wikitext data sources both
+    expose this shape — the training loop itself is task-agnostic.
+
+    If ``val_batches`` is provided, evaluates mean per-token val loss
+    over those batches every ``val_capture_interval`` steps (plus once
+    at step 0 and once at the end).  The val pass switches the model
+    to ``eval()`` and back; gradients are disabled inside ``eval_val_loss``.
+
+    If ``schedule == "cosine"``, applies cosine decay (with optional
+    linear warmup of ``warmup_frac × steps``) to every param group's
+    ``lr`` field, scaling from the peak LR down to ``min_lr_ratio × peak``.
+    Works on any optimizer (or ``CombinedOptimizer``) that exposes
+    ``param_groups``.
 
     If track_norms is True, snapshots of norm-layer (γ, β) mean values
     are recorded every norm_capture_interval steps.
@@ -393,14 +716,31 @@ def run_training(
     losses = []
     step_times = []
     norm_trajectories: list[dict] = []
+    val_history: list[tuple[int, float]] = []
     total_start = time.perf_counter()
+
+    do_val = val_batches is not None and val_capture_interval is not None
+
+    # Capture peak LR per param group for the scheduler
+    peak_lrs: Optional[list[float]] = None
+    if schedule == "cosine":
+        peak_lrs = [float(g.get("lr", 0.0)) for g in optimizer.param_groups]
 
     # Capture initial norm params if tracking is enabled
     if track_norms:
         norm_trajectories.append({"step": 0, "layers": extract_norm_tensors(model)})
+    if do_val:
+        val_history.append((0, eval_val_loss(model, val_batches, vocab_size,
+                                             ignore_index)))
 
     for step in range(steps):
-        x, y = generate_batch(vocab_size, batch_size, seq_len, device)
+        # Apply LR schedule (cosine + optional warmup)
+        if peak_lrs is not None:
+            factor = cosine_lr_factor(step, steps, warmup_frac, min_lr_ratio)
+            for g, peak in zip(optimizer.param_groups, peak_lrs):
+                g["lr"] = peak * factor
+
+        x, y = batch_fn()
 
         step_start = time.perf_counter()
         optimizer.zero_grad()
@@ -408,7 +748,7 @@ def run_training(
         loss = F.cross_entropy(
             logits.view(-1, vocab_size),
             y.view(-1),
-            ignore_index=0,
+            ignore_index=ignore_index,
         )
         loss.backward()
         optimizer.step()
@@ -417,8 +757,11 @@ def run_training(
         losses.append(loss.item())
 
         if (step + 1) % 50 == 0:
+            extra = ""
+            if do_val and val_history:
+                extra = f"  val {val_history[-1][1]:.4f}"
             print(f"  [{label}] step {step + 1:5d}/{steps}  loss {loss.item():.4f}  "
-                  f"time/step {step_times[-1]:.4f}s")
+                  f"time/step {step_times[-1]:.4f}s{extra}")
 
         # Capture norm params at intervals
         if track_norms and (step + 1) % norm_capture_interval == 0:
@@ -427,11 +770,24 @@ def run_training(
                 "layers": extract_norm_tensors(model),
             })
 
+        # Capture val loss at intervals
+        if do_val and (step + 1) % val_capture_interval == 0:
+            val_history.append((step + 1, eval_val_loss(
+                model, val_batches, vocab_size, ignore_index,
+            )))
+
     # Final norm capture
     if track_norms and steps % norm_capture_interval != 0:
         norm_trajectories.append({"step": steps, "layers": extract_norm_tensors(model)})
+    if do_val and (not val_history or val_history[-1][0] != steps):
+        val_history.append((steps, eval_val_loss(
+            model, val_batches, vocab_size, ignore_index,
+        )))
 
     total_time = time.perf_counter() - total_start
+
+    val_min = min(v for _, v in val_history) if val_history else None
+    val_final = val_history[-1][1] if val_history else None
 
     return {
         "label": label,
@@ -444,6 +800,9 @@ def run_training(
         "median_step_time_s": sorted(step_times)[len(step_times) // 2],
         "step_times": step_times,
         "norm_trajectories": norm_trajectories if track_norms else [],
+        "val_history": val_history,        # list[(step, val_loss)]
+        "val_min": val_min,                # None if val tracking off
+        "val_final": val_final,            # None if val tracking off
     }
 
 
@@ -626,6 +985,258 @@ def plot_norm_trajectories(results: list[dict], save_path: Optional[Path] = None
     plt.close(fig)
 
 
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  LR SWEEP                                                           ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+
+def run_lr_sweep(
+    optimizers: list,
+    lrs: list[float],
+    make_model,
+    *,
+    steps: int,
+    vocab_size: int,
+    batch_fn,
+    device: torch.device,
+    ignore_index: int,
+    val_batches: Optional[list] = None,
+    val_capture_interval: Optional[int] = None,
+    schedule: Optional[str] = None,
+    warmup_frac: float = 0.0,
+    min_lr_ratio: float = 0.1,
+) -> dict:
+    """Run every optimizer at every LR.  Returns a nested dict
+    ``{label: {lr: run_dict}}``.
+
+    Norm-trajectory tracking is disabled (only meaningful at one LR).
+    Val tracking is propagated to each sub-run when provided.
+    """
+    out: dict[str, dict[float, dict]] = {label: {} for label, _ in optimizers}
+    total = len(optimizers) * len(lrs)
+    i = 0
+    for label, make_opt in optimizers:
+        for lr in lrs:
+            i += 1
+            print(f"{'=' * 60}")
+            print(f"  [{i}/{total}] {label}  lr={lr:g}")
+            print(f"{'=' * 60}")
+            model = make_model()
+            opt = make_opt(model, lr)
+            r = run_training(
+                model, opt,
+                steps=steps,
+                vocab_size=vocab_size,
+                batch_fn=batch_fn,
+                device=device,
+                label=f"{label}@lr={lr:g}",
+                track_norms=False,
+                ignore_index=ignore_index,
+                val_batches=val_batches,
+                val_capture_interval=val_capture_interval,
+                schedule=schedule,
+                warmup_frac=warmup_frac,
+                min_lr_ratio=min_lr_ratio,
+            )
+            r["base_label"] = label
+            r["lr"] = lr
+            out[label][lr] = r
+            print()
+    return out
+
+
+def _has_val(sweep: dict) -> bool:
+    for by_lr in sweep.values():
+        for r in by_lr.values():
+            if r.get("val_min") is not None:
+                return True
+    return False
+
+
+def _matrix_table(sweep: dict, lrs: list[float], metric: str, label_w: int) -> None:
+    """Print one  optimizer × LR  table for the given metric key.
+
+    Cells are formatted to width 10.  The cell at each row's best LR
+    (lowest value) is marked with a trailing '*'.
+    """
+    header_lrs = "  ".join(f"{lr:>10g}" for lr in lrs)
+    print(f"{'Optimizer':<{label_w}} {header_lrs}")
+    print("-" * (label_w + 1 + 12 * len(lrs)))
+    for label, by_lr in sweep.items():
+        # Best LR for this row
+        present = {lr: by_lr[lr][metric] for lr in lrs
+                   if lr in by_lr and by_lr[lr].get(metric) is not None}
+        best_lr = min(present, key=present.get) if present else None
+        cells = []
+        for lr in lrs:
+            r = by_lr.get(lr)
+            v = None if r is None else r.get(metric)
+            if v is None:
+                cells.append(f"{'—':>10}")
+            elif lr == best_lr:
+                cells.append(f"{v:>9.4f}*")
+            else:
+                cells.append(f"{v:>10.4f}")
+        print(f"{label:<{label_w}} " + "  ".join(cells))
+
+
+def print_lr_sweep_summary(sweep: dict, lrs: list[float]) -> None:
+    """Print  optimizer × LR  table(s) of min loss + best-of summary.
+
+    If val tracking is enabled, prints both train-loss and val-loss
+    matrices and ranks the best-of summary by val loss (otherwise by
+    train loss).
+    """
+    label_w = max(15, max(len(label) for label in sweep) + 1)
+    has_val = _has_val(sweep)
+
+    print(f"{'=' * 60}")
+    print("  LR SWEEP — train min loss per (optimizer, lr)")
+    print(f"{'=' * 60}")
+    _matrix_table(sweep, lrs, "loss_min", label_w)
+    print()
+    print("  * = best LR for that optimizer (lowest train min)")
+    print()
+
+    if has_val:
+        print(f"{'=' * 60}")
+        print("  LR SWEEP — val min loss per (optimizer, lr)")
+        print(f"{'=' * 60}")
+        _matrix_table(sweep, lrs, "val_min", label_w)
+        print()
+        print("  * = best LR for that optimizer (lowest val min)")
+        print()
+
+    print(f"{'=' * 60}")
+    rank_metric = "val_min" if has_val else "loss_min"
+    print(f"  BEST-OF SUMMARY (ranked by {rank_metric})")
+    print(f"{'=' * 60}")
+    cols = ["Optimizer", "Best LR", "Val min", "Val final",
+            "Train min", "Train final", "Step (ms)"]
+    if not has_val:
+        cols = ["Optimizer", "Best LR", "Train min",
+                "Train final", "Total", "Step (ms)"]
+    widths = [label_w, 10] + [11] * (len(cols) - 2)
+    print(" ".join(f"{c:<{w}}" for c, w in zip(cols, widths)))
+    print("-" * (sum(widths) + len(widths)))
+
+    def _row_metric(r):
+        v = r.get(rank_metric)
+        return v if v is not None else float("inf")
+
+    ranked = sorted(
+        sweep.items(),
+        key=lambda kv: min(_row_metric(r) for r in kv[1].values()),
+    )
+    for label, by_lr in ranked:
+        best_lr = min(by_lr, key=lambda l: _row_metric(by_lr[l]))
+        r = by_lr[best_lr]
+        step_ms = r["mean_step_time_s"] * 1000
+        if has_val:
+            vmin = r.get("val_min")
+            vfin = r.get("val_final")
+            cells = [
+                f"{label:<{label_w}}",
+                f"{best_lr:<10g}",
+                f"{vmin:<11.4f}" if vmin is not None else f"{'—':<11}",
+                f"{vfin:<11.4f}" if vfin is not None else f"{'—':<11}",
+                f"{r['loss_min']:<11.4f}",
+                f"{r['loss_final']:<11.4f}",
+                f"{step_ms:<11.2f}",
+            ]
+        else:
+            cells = [
+                f"{label:<{label_w}}",
+                f"{best_lr:<10g}",
+                f"{r['loss_min']:<11.4f}",
+                f"{r['loss_final']:<11.4f}",
+                f"{r['total_time_s']:<10.1f}s",
+                f"{step_ms:<11.2f}",
+            ]
+        print(" ".join(cells))
+    print()
+
+
+def save_lr_sweep_json(sweep: dict, lrs: list[float], path: Path) -> None:
+    """Write a compact JSON for the sweep (strip per-step time arrays;
+    keep val_history since it's tiny and useful for plotting offline)."""
+    json_data: dict = {"lrs": lrs, "runs": {}}
+    for label, by_lr in sweep.items():
+        json_data["runs"][label] = {}
+        for lr, r in by_lr.items():
+            entry = {k: v for k, v in r.items()
+                     if k not in ("step_times", "norm_trajectories")}
+            entry["step_times_summary"] = {
+                "mean": r["mean_step_time_s"],
+                "median": r["median_step_time_s"],
+                "min": min(r["step_times"]),
+                "max": max(r["step_times"]),
+            }
+            json_data["runs"][label][str(lr)] = entry
+    with open(path, "w") as f:
+        json.dump(json_data, f, indent=2)
+    print(f"[benchmark] LR sweep results saved to {path}")
+
+
+def plot_lr_sweep(sweep: dict, lrs: list[float], save_path: Path) -> None:
+    """Min loss vs LR for each optimizer (log-x).  If val tracking
+    was on, draws train and val on a 1×2 panel."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("[benchmark] matplotlib not installed — skipping plot")
+        return
+
+    colors = {
+        "Gamuon": "#4C72B0",
+        "Gamuon+Conf": "#8E44AD",
+        "Muon (NS)": "#DD8452",
+        "Adam": "#55A868",
+        "Gamuon (no rotor)": "#7FB6E0",
+        "Gamuon (pad-square)": "#2A4E7A",
+    }
+    has_val = _has_val(sweep)
+    if has_val:
+        fig, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=False)
+        ax_train, ax_val = axes
+    else:
+        fig, ax_train = plt.subplots(figsize=(8, 5))
+        ax_val = None
+
+    def _draw(ax, metric):
+        for label, by_lr in sweep.items():
+            xs, ys = [], []
+            for lr in lrs:
+                r = by_lr.get(lr)
+                if r is None or r.get(metric) is None:
+                    continue
+                xs.append(lr)
+                ys.append(r[metric])
+            if xs:
+                ax.plot(xs, ys, marker="o", linewidth=2,
+                        color=colors.get(label, "gray"), label=label)
+        ax.set_xscale("log")
+        ax.set_xlabel("Learning rate")
+        ax.grid(True, which="both", alpha=0.3)
+        ax.legend(fontsize=9, loc="best")
+
+    _draw(ax_train, "loss_min")
+    ax_train.set_ylabel("Min train loss")
+    ax_train.set_title("LR sensitivity — train")
+
+    if ax_val is not None:
+        _draw(ax_val, "val_min")
+        ax_val.set_ylabel("Min val loss")
+        ax_val.set_title("LR sensitivity — val")
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[benchmark] LR sweep plot saved to {save_path}")
+
+
 def plot_results(
     results: list[dict],
     save_path: Optional[Path] = None,
@@ -646,12 +1257,17 @@ def plot_results(
         "Gamuon+Conf": "#8E44AD",
         "Muon (NS)": "#DD8452",
         "Adam": "#55A868",
+        # Ablations
+        "Gamuon (no rotor)": "#7FB6E0",     # light blue (related to Gamuon)
+        "Gamuon (pad-square)": "#2A4E7A",   # dark blue (related to Gamuon)
     }
     markers = {
         "Gamuon": "o",
         "Gamuon+Conf": "D",
         "Muon (NS)": "s",
         "Adam": "^",
+        "Gamuon (no rotor)": "o",
+        "Gamuon (pad-square)": "o",
     }
 
     # ── Loss vs steps ──────────────────────────────────────────────
@@ -770,6 +1386,55 @@ def main():
                         help="Use GroupNorm instead of LayerNorm for all norm layers")
     parser.add_argument("--groupnorm-groups", type=int, default=8,
                         help="Number of groups for GroupNorm (default: 8)")
+    parser.add_argument(
+        "--ablations", action="store_true",
+        help="Also run ablation variants: 'Gamuon (no rotor)' "
+             "(lr_bivector=0) and 'Gamuon (pad-square)' (pre-fix "
+             "non-square padding).  Slows the run roughly proportionally.",
+    )
+    parser.add_argument(
+        "--task", choices=("synthetic", "wikitext"), default="synthetic",
+        help="Training task.  'synthetic' (default) generates random "
+             "next-token sequences from a small vocabulary.  'wikitext' "
+             "uses Salesforce/wikitext (wikitext-2-raw-v1) tokenised "
+             "with the gpt2 BPE; vocab_size is overridden to 50257 and "
+             "the cached dataset/tokeniser are loaded from $HF_HOME.",
+    )
+    parser.add_argument(
+        "--lr-sweep", default=None, type=str,
+        help="Comma-separated list of learning rates to sweep "
+             "(e.g. '3e-4,1e-3,3e-3,1e-2').  When set, runs every "
+             "optimizer at every LR and reports the best-of per "
+             "optimizer plus an LR-sensitivity plot.  Disables norm-"
+             "trajectory tracking (which is only meaningful at one LR).",
+    )
+    parser.add_argument(
+        "--val-batches", type=int, default=16,
+        help="Number of fixed validation batches per capture (wikitext "
+             "only).  Each is batch_size × seq_len tokens drawn at "
+             "evenly-spaced offsets through the validation stream.  "
+             "Set to 0 to disable val tracking.",
+    )
+    parser.add_argument(
+        "--val-every", type=int, default=0,
+        help="Steps between validation captures (wikitext only).  "
+             "0 → max(1, steps // 20).  Ignored if --val-batches=0.",
+    )
+    parser.add_argument(
+        "--schedule", choices=("none", "cosine"), default="none",
+        help="LR schedule.  'none' = constant LR.  'cosine' = optional "
+             "linear warmup → cosine decay to min_lr_ratio × peak LR.",
+    )
+    parser.add_argument(
+        "--warmup-frac", type=float, default=0.05,
+        help="Fraction of total steps spent in linear warmup when "
+             "--schedule=cosine.  Default 0.05 (5%%).",
+    )
+    parser.add_argument(
+        "--lr-min-ratio", type=float, default=0.1,
+        help="Final-LR / peak-LR ratio when --schedule=cosine.  "
+             "Default 0.1.",
+    )
     args = parser.parse_args()
 
     device = torch.device(
@@ -778,7 +1443,41 @@ def main():
     print(f"[benchmark] Device: {device}")
     print(f"[benchmark] Transformer: {args.n_layers} layers, "
           f"d_model={args.d_model}, d_ff={args.d_ff}")
-    print(f"[benchmark] Data: vocab={args.vocab_size}, "
+    print(f"[benchmark] Task: {args.task}")
+
+    # ── Pick the data source (synthetic vs. wikitext-2) ────────────
+    # vocab_size and ignore_index depend on the task.  Synthetic uses
+    # token 0 as a pad sentinel; wikitext doesn't, so we disable the
+    # ignore behaviour by using -100 (PyTorch's no-ignore default).
+    val_batches = None
+    val_capture_interval = None
+    if args.task == "wikitext":
+        print("[benchmark] Loading wikitext-2-raw-v1 (gpt2 BPE)...")
+        tokens, vocab_size = load_wikitext_tokens(split="train")
+        print(f"[benchmark]   train tokens={tokens.numel():,}, vocab={vocab_size:,}")
+        batch_fn = make_wikitext_batch_fn(
+            tokens, args.batch_size, args.seq_len, device
+        )
+        ignore_index = -100
+        if args.val_batches > 0:
+            val_batches = load_wikitext_val_batches(
+                args.seq_len, args.batch_size, args.val_batches, device,
+            )
+            val_capture_interval = (
+                args.val_every if args.val_every > 0
+                else max(1, args.steps // 20)
+            )
+            print(f"[benchmark]   val batches={len(val_batches)}  "
+                  f"({len(val_batches) * args.batch_size * args.seq_len:,} tokens "
+                  f"per capture, every {val_capture_interval} steps)")
+    else:
+        vocab_size = args.vocab_size
+
+        def batch_fn():
+            return generate_batch(vocab_size, args.batch_size, args.seq_len, device)
+        ignore_index = 0  # preserve historical behaviour
+
+    print(f"[benchmark] Data: vocab={vocab_size}, "
           f"batch={args.batch_size}, seq_len={args.seq_len}")
     print(f"[benchmark] Steps: {args.steps}, LR: {args.lr}, Seed: {args.seed}")
     if args.groupnorm:
@@ -802,7 +1501,7 @@ def main():
         else:
             norm_type = "layernorm"
         return SmallTransformer(
-            vocab_size=args.vocab_size,
+            vocab_size=vocab_size,
             d_model=args.d_model,
             d_ff=args.d_ff,
             n_layers=args.n_layers,
@@ -820,81 +1519,103 @@ def main():
     # Muon:                      NS projection for 2D + SGD for rest.
     # Adam:                      Standard baseline (all params).
 
-    def make_gamuon(model):
-        groups = get_param_groups(model, args.lr)
-        matrix_group = None
-        other_group = None
-        for g in groups:
-            if g["params"][0].ndim == 2:
-                matrix_group = {"params": g["params"], "lr": g["lr"]}
-            else:
-                other_group = {"params": g["params"], "lr": g["lr"]}
+    def _matrix_flow_combo(model, lr, matrix_opt_ctor):
+        """Build  Adam(embed+head) ⊕ <matrix_opt_ctor>(internal 2D) ⊕ SGD(1D).
 
-        gamuon_opt = Gamuon(
-            [matrix_group] if matrix_group else [],
-            lr=args.lr,
-            betas=(0.9, 0.999),
-            weight_decay=0.0,
-        )
-        sgd_opt = torch.optim.SGD(
-            [other_group] if other_group else [],
-            lr=args.lr,
-        )
-        return CombinedOptimizer(gamuon_opt, sgd_opt)
+        ``matrix_opt_ctor``  is a callable taking the list of internal
+        2-D params and returning a configured optimizer (Gamuon,
+        GamuonPadSquare, MuonOptimizer, …).
+        """
+        embed_head, internal, other = split_params_for_muon(model)
+        subs = []
+        if internal:
+            subs.append(matrix_opt_ctor(internal))
+        if embed_head:
+            subs.append(torch.optim.Adam(
+                [{"params": embed_head, "lr": lr}],
+                lr=lr, betas=(0.9, 0.999), weight_decay=0.0,
+            ))
+        if other:
+            subs.append(torch.optim.SGD(
+                [{"params": other, "lr": lr}], lr=lr,
+            ))
+        return CombinedOptimizer(*subs)
 
-    def make_gamuon_conformal(model):
-        """Gamuon for matrix weights + ConformalMuon for norm (γ, β)."""
-        # Detect norm-layer parameter pairs
+    def make_gamuon(model, lr):
+        return _matrix_flow_combo(model, lr, lambda ps: Gamuon(
+            [{"params": ps, "lr": lr}],
+            lr=lr, betas=(0.9, 0.999), weight_decay=0.0,
+        ))
+
+    def make_gamuon_conformal(model, lr):
+        """Gamuon for internal 2D matrices + ConformalMuon for norm (γ, β)
+        pairs + Adam for the embedding/head + SGD for any remaining 1D
+        param.  Constructed manually rather than via GamuonAuto so the
+        large vocab-sized layers can be diverted to Adam (Muon-standard
+        practice — the dense rotor on (vocab, d_model) is intractable).
+        """
+        embed_head, internal, other = split_params_for_muon(model)
         pairs = find_conformal_pairs(model)
-        conformal_ids = set()
+        pair_ids: set[int] = set()
         for w, b in pairs:
-            conformal_ids.add(id(w))
+            pair_ids.add(id(w))
             if b is not None:
-                conformal_ids.add(id(b))
+                pair_ids.add(id(b))
+        other_sgd = [p for p in other if id(p) not in pair_ids]
 
-        # Partition remaining params: 2D → Gamuon, rest → SGD
-        matrix_params = []
-        other_params = []
-        for _, p in model.named_parameters():
-            if id(p) in conformal_ids:
-                continue
-            if p.ndim == 2:
-                matrix_params.append(p)
-            else:
-                other_params.append(p)
+        subs = []
+        if pairs:
+            subs.append(ConformalMuon(
+                pairs, lr=lr, betas=(0.9, 0.999), weight_decay=0.0,
+            ))
+        if internal:
+            subs.append(Gamuon(
+                [{"params": internal, "lr": lr}],
+                lr=lr, betas=(0.9, 0.999), weight_decay=0.0,
+            ))
+        if embed_head:
+            subs.append(torch.optim.Adam(
+                [{"params": embed_head, "lr": lr}],
+                lr=lr, betas=(0.9, 0.999), weight_decay=0.0,
+            ))
+        if other_sgd:
+            subs.append(torch.optim.SGD(
+                [{"params": other_sgd, "lr": lr}], lr=lr,
+            ))
+        return CombinedOptimizer(*subs)
 
-        gamuon_opt = Gamuon(
-            [{"params": matrix_params, "lr": args.lr}] if matrix_params else [],
-            lr=args.lr,
-            betas=(0.9, 0.999),
-            weight_decay=0.0,
-        )
-        conformal_opt = ConformalMuon(
-            pairs,
-            lr=args.lr,
-            betas=(0.9, 0.999),
-        )
-        sgd_opt = torch.optim.SGD(
-            [{"params": other_params, "lr": args.lr}] if other_params else [],
-            lr=args.lr,
-        )
-        return CombinedOptimizer(gamuon_opt, conformal_opt, sgd_opt)
+    def make_muon(model, lr):
+        return _matrix_flow_combo(model, lr, lambda ps: MuonOptimizer(
+            [{"params": ps, "lr": lr}],
+            lr=lr, weight_decay=0.0, ns_iters=5,
+        ))
 
-    def make_muon(model):
-        return MuonOptimizer(
-            get_param_groups(model, args.lr),
-            lr=args.lr,
-            weight_decay=0.0,
-            ns_iters=5,
-        )
-
-    def make_adam(model):
+    def make_adam(model, lr):
         return torch.optim.Adam(
             model.parameters(),
-            lr=args.lr,
+            lr=lr,
             betas=(0.9, 0.999),
             weight_decay=0.0,
         )
+
+    def make_gamuon_no_rotor(model, lr):
+        """Ablation: Gamuon with lr_bivector=0 (rotor disabled).
+
+        Tests whether the bivector / rotor path actually contributes
+        beyond what the scalar + strain (Adam-like) updates do.
+        """
+        return _matrix_flow_combo(model, lr, lambda ps: Gamuon(
+            [{"params": ps, "lr": lr}],
+            lr=lr, betas=(0.9, 0.999),
+            weight_decay=0.0, lr_bivector=0.0,
+        ))
+
+    def make_gamuon_pad_square(model, lr):
+        """Ablation: pre-fix non-square handling (pad to square)."""
+        return _matrix_flow_combo(model, lr, lambda ps: GamuonPadSquare(
+            [{"params": ps, "lr": lr}],
+            lr=lr, betas=(0.9, 0.999), weight_decay=0.0,
+        ))
 
     optimizers = [
         ("Gamuon", make_gamuon),
@@ -902,15 +1623,48 @@ def main():
         ("Muon (NS)", make_muon),
         ("Adam", make_adam),
     ]
+    if args.ablations:
+        optimizers.extend([
+            ("Gamuon (no rotor)", make_gamuon_no_rotor),
+            ("Gamuon (pad-square)", make_gamuon_pad_square),
+        ])
 
-    # ── Run benchmarks ─────────────────────────────────────────────
+    # ── Run benchmarks (single LR or sweep) ────────────────────────
+    if args.lr_sweep:
+        sweep_lrs = [float(s.strip()) for s in args.lr_sweep.split(",") if s.strip()]
+        if not sweep_lrs:
+            raise ValueError(f"--lr-sweep parsed to empty list: {args.lr_sweep!r}")
+        print(f"[benchmark] LR sweep: {sweep_lrs}")
+        print()
+        sweep_results = run_lr_sweep(
+            optimizers, sweep_lrs, make_model,
+            steps=args.steps, vocab_size=vocab_size,
+            batch_fn=batch_fn, device=device,
+            ignore_index=ignore_index,
+            val_batches=val_batches,
+            val_capture_interval=val_capture_interval,
+            schedule=args.schedule if args.schedule != "none" else None,
+            warmup_frac=args.warmup_frac,
+            min_lr_ratio=args.lr_min_ratio,
+        )
+        print_lr_sweep_summary(sweep_results, sweep_lrs)
+        results_dir = Path(__file__).resolve().parent
+        save_lr_sweep_json(sweep_results, sweep_lrs,
+                           results_dir / "benchmark_lr_sweep.json")
+        if not args.no_plot:
+            plot_lr_sweep(sweep_results, sweep_lrs,
+                          results_dir / "benchmark_lr_sweep.pdf")
+        print("[benchmark] Done!")
+        return
+
+    # Single-LR mode (existing behaviour: norm-trajectory tracking etc.)
     results = []
     for label, make_opt in optimizers:
         print(f"{'=' * 60}")
         print(f"  Optimizer: {label}")
         print(f"{'=' * 60}")
         model = make_model()
-        opt = make_opt(model)
+        opt = make_opt(model, args.lr)
 
         # Track norm trajectories for the two optimizers that treat
         # norm layers differently (SGD vs ConformalMuon)
@@ -919,13 +1673,18 @@ def main():
         r = run_training(
             model, opt,
             steps=args.steps,
-            vocab_size=args.vocab_size,
-            batch_size=args.batch_size,
-            seq_len=args.seq_len,
+            vocab_size=vocab_size,
+            batch_fn=batch_fn,
             device=device,
             label=label,
             track_norms=track_norms,
-            norm_capture_interval=args.steps // 20,
+            norm_capture_interval=max(1, args.steps // 20),
+            ignore_index=ignore_index,
+            val_batches=val_batches,
+            val_capture_interval=val_capture_interval,
+            schedule=args.schedule if args.schedule != "none" else None,
+            warmup_frac=args.warmup_frac,
+            min_lr_ratio=args.lr_min_ratio,
         )
         results.append(r)
         print()
@@ -937,12 +1696,28 @@ def main():
     print(f"{'=' * 60}")
     print("  SUMMARY")
     print(f"{'=' * 60}")
-    print(f"{'Optimizer':<15} {'Final loss':<12} {'Min loss':<12} "
-          f"{'Total time':<12} {'Mean step':<12}")
-    print("-" * 63)
-    for r in results:
-        print(f"{r['label']:<15} {r['loss_final']:<12.4f} {r['loss_min']:<12.4f} "
-              f"{r['total_time_s']:<12.3f}s {r['mean_step_time_s']:<12.5f}s")
+    label_w = max(15, max(len(r["label"]) for r in results) + 1)
+    has_val = any(r.get("val_min") is not None for r in results)
+    if has_val:
+        print(f"{'Optimizer':<{label_w}} {'Train min':<11} {'Train final':<12} "
+              f"{'Val min':<10} {'Val final':<10} {'Total':<10} {'Step (ms)':<10}")
+        print("-" * (label_w + 11 + 12 + 10 + 10 + 10 + 10 + 6))
+        for r in results:
+            vmin = r.get("val_min")
+            vfin = r.get("val_final")
+            vmin_s = f"{vmin:<10.4f}" if vmin is not None else f"{'—':<10}"
+            vfin_s = f"{vfin:<10.4f}" if vfin is not None else f"{'—':<10}"
+            print(f"{r['label']:<{label_w}} {r['loss_min']:<11.4f} "
+                  f"{r['loss_final']:<12.4f} {vmin_s} {vfin_s} "
+                  f"{r['total_time_s']:<9.1f}s {r['mean_step_time_s']*1000:<10.2f}")
+    else:
+        print(f"{'Optimizer':<{label_w}} {'Final loss':<12} {'Min loss':<12} "
+              f"{'Total time':<13} {'Mean step':<12}")
+        print("-" * (label_w + 12 + 12 + 13 + 12 + 4))
+        for r in results:
+            print(f"{r['label']:<{label_w}} {r['loss_final']:<12.4f} "
+                  f"{r['loss_min']:<12.4f} "
+                  f"{r['total_time_s']:<12.3f}s {r['mean_step_time_s']:<12.5f}s")
     print()
 
     # ── Save results ──────────────────────────────────────────────
